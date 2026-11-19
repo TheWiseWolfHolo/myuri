@@ -168,6 +168,19 @@ pub fn post(url: &str, headers: &[(String, String)], body: &[u8]) -> Result<(u16
     Ok((status?, reply))
 }
 
+/// Store a document at `url`, replacing what is there. Blocks.
+pub fn put(url: &str, headers: &[(String, String)], body: &[u8]) -> Result<(), String> {
+    let slot = AtomicUsize::new(0);
+    let mut reply = Vec::new();
+    let status =
+        exchange(w!("PUT"), url, headers, body, &slot, &mut |_, bytes| reply.extend_from_slice(bytes));
+    close(&slot);
+    match status? {
+        200..=299 => Ok(()),
+        status => Err(llm::describe_failure(status, &String::from_utf8_lossy(&reply))),
+    }
+}
+
 /// Delete a document. Best effort cleanup; the reply body is ignored.
 pub fn delete(url: &str, headers: &[(String, String)]) -> Result<(), String> {
     let slot = AtomicUsize::new(0);

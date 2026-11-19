@@ -21,6 +21,7 @@ mod panel;
 mod picker;
 mod secrets;
 mod shell;
+mod syncview;
 mod speech;
 mod theme;
 mod tray;

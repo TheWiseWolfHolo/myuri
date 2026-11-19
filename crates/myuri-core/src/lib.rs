@@ -2,6 +2,7 @@
 //! configuration, hotkey parsing and assistant matching. Nothing here touches
 //! Win32 or the UI, so `cargo test -p myuri-core` runs in seconds.
 
+pub mod backup;
 pub mod brand;
 pub mod catalog;
 pub mod config;

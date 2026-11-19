@@ -41,6 +41,7 @@ enum Tab {
     Speech,
     General,
     History,
+    Sync,
 }
 
 impl Tab {
@@ -49,7 +50,7 @@ impl Tab {
             Self::Chat => Some(Purpose::Chat),
             Self::Images => Some(Purpose::Images),
             Self::Speech => Some(Purpose::Speech),
-            Self::Assistants | Self::General | Self::History => None,
+            Self::Assistants | Self::General | Self::History | Self::Sync => None,
         }
     }
 
@@ -61,6 +62,7 @@ impl Tab {
             Self::Speech => "speech",
             Self::General => "general",
             Self::History => "history",
+            Self::Sync => "sync",
         }
     }
 
@@ -72,13 +74,14 @@ impl Tab {
             "speech" => Self::Speech,
             "general" => Self::General,
             "history" => Self::History,
+            "sync" => Self::Sync,
             _ => return None,
         })
     }
 
     /// The page is a view of its own instead of a list and a form.
     fn own_page(self) -> bool {
-        matches!(self, Self::History)
+        matches!(self, Self::History | Self::Sync)
     }
 }
 
@@ -154,6 +157,7 @@ pub struct SettingsView {
     /// The picker is choosing the default model rather than an assistant's.
     picker_default: bool,
     history: Entity<crate::historyview::HistoryView>,
+    sync: Entity<crate::syncview::SyncView>,
     /// `[models] default`: what assistants without a model use.
     default_model: Entity<InputState>,
     prompt: Entity<TextareaState>,
@@ -262,7 +266,7 @@ impl SettingsView {
         let default_model = line("", window, cx);
         let name = line("助手的名字", window, cx);
         let search = line("搜索", window, cx);
-        let subscriptions = vec![cx.subscribe_in(&search, window, |_, _, event: &InputEvent, _, cx| {
+        let mut subscriptions = vec![cx.subscribe_in(&search, window, |_, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
@@ -280,8 +284,18 @@ impl SettingsView {
             let dir = dir.clone();
             cx.new(|cx| crate::historyview::HistoryView::new(dir, theme::palette(dark), window, cx))
         };
+        let sync = {
+            let dir = dir.clone();
+            cx.new(|cx| crate::syncview::SyncView::new(dir, theme::palette(dark), window, cx))
+        };
+        let restored = cx.subscribe_in(&sync, window, |this, _, _: &crate::syncview::Restored, window, cx| {
+            this.reload(window, cx);
+            cx.notify();
+        });
+        subscriptions.push(restored);
         let mut view = Self {
             history,
+            sync,
             catalog: std::sync::Arc::new(models::load(&dir)),
             dir,
             palette: theme::palette(dark),
@@ -995,6 +1009,7 @@ impl SettingsView {
             (Tab::Speech, "icons/audio-lines.svg", "语音"),
             (Tab::General, "icons/sliders-horizontal.svg", "通用"),
             (Tab::History, "icons/history.svg", "历史"),
+            (Tab::Sync, "icons/cloud-upload.svg", "同步"),
         ];
         div()
             .w(px(150.0))
@@ -1024,7 +1039,7 @@ impl SettingsView {
         let query = self.search.read(cx).value().trim().to_lowercase();
         let found = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
         let rows: Vec<AnyElement> = match self.tab {
-            Tab::General | Tab::History => return None,
+            Tab::General | Tab::History | Tab::Sync => return None,
             Tab::Assistants => self
                 .assistants
                 .iter()
@@ -1951,11 +1966,12 @@ impl Render for SettingsView {
             Tab::Assistants => self.assistant_form(cx),
             Tab::Chat | Tab::Images | Tab::Speech => self.provider_form(cx),
             Tab::General => self.general_form(cx),
-            Tab::History => Vec::new(),
+            Tab::History | Tab::Sync => Vec::new(),
         };
         // Pages that are views of their own fill everything right of the nav.
         let page = match self.tab {
             Tab::History => Some(div().flex_1().min_w(px(0.0)).h_full().child(self.history.clone())),
+            Tab::Sync => Some(div().flex_1().min_w(px(0.0)).h_full().child(self.sync.clone())),
             _ => None,
         };
         let title = div()
@@ -2057,14 +2073,14 @@ fn row(id: impl Into<ElementId>, palette: Palette, open: bool) -> Stateful<Div> 
         .hover(move |style| style.bg(palette.selected))
 }
 
-fn heading(text: String, palette: Palette) -> Div {
+pub(crate) fn heading(text: String, palette: Palette) -> Div {
     div().flex().items_center().gap(px(10.0)).child(
         div().font(theme::serif()).text_size(px(21.0)).text_color(palette.ink).child(text),
     )
 }
 
 /// A labelled part of a form.
-fn field(label: &'static str, content: impl IntoElement, palette: Palette) -> AnyElement {
+pub(crate) fn field(label: &'static str, content: impl IntoElement, palette: Palette) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -2075,7 +2091,7 @@ fn field(label: &'static str, content: impl IntoElement, palette: Palette) -> An
 }
 
 /// The frame around a text input.
-fn boxed(input: impl IntoElement, palette: Palette) -> Div {
+pub(crate) fn boxed(input: impl IntoElement, palette: Palette) -> Div {
     div()
         .rounded(px(10.0))
         .border_1()
@@ -2106,7 +2122,7 @@ fn choice(id: impl Into<ElementId>, label: &'static str, chosen: bool, palette: 
         .child(label)
 }
 
-fn button(id: &'static str, label: &'static str, primary: bool, palette: Palette) -> Stateful<Div> {
+pub(crate) fn button(id: &'static str, label: &'static str, primary: bool, palette: Palette) -> Stateful<Div> {
     let label: SharedString = label.into();
     div()
         .id(id)
@@ -2161,7 +2177,7 @@ fn key_button(id: impl Into<ElementId>, icon: &'static str, enabled: bool, palet
         )
 }
 
-fn switch(id: impl Into<ElementId>, on: bool, palette: Palette) -> Stateful<Div> {
+pub(crate) fn switch(id: impl Into<ElementId>, on: bool, palette: Palette) -> Stateful<Div> {
     div()
         .id(id)
         .w(px(36.0))

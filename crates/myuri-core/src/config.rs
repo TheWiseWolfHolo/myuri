@@ -87,6 +87,12 @@ theme = "system"
 # asr = "soniox/stt-async-v6"
 # tts = "elevenlabs/eleven_v4"
 
+[sync]
+# 备份放在哪个 WebDAV 文件夹。密码存在 Windows 凭据管理器里，在设置窗口里填。
+# webdav_url = "https://dav.example.com/myuri"
+# webdav_user = "me"
+# history = true                # 备份里带上对话历史
+
 [models]
 # 给模型起个档位名，助手里写档位名，换模型时只改这一处。
 # 写法是 "供应商 id/模型名"。助手没写 model 时用 default。
@@ -160,9 +166,22 @@ pub struct Settings {
     pub capture: CaptureSettings,
     pub panel: PanelSettings,
     pub speech: SpeechSettings,
+    pub sync: SyncSettings,
     pub log: LogSettings,
     /// Tier name to model reference, e.g. `fast = "openai/gpt-4o-mini"`.
     pub models: BTreeMap<String, String>,
+}
+
+/// Where a copy of the configuration is kept. The password is in the
+/// Windows credential store, not here.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncSettings {
+    /// A folder on a WebDAV server.
+    pub webdav_url: String,
+    pub webdav_user: String,
+    /// Conversations are part of the backup.
+    pub history: bool,
 }
 
 /// Which provider and model handle speech in each direction.
