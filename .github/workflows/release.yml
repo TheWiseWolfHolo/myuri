@@ -34,7 +34,7 @@ jobs:
           Copy-Item target/release/myuri.exe, README.md, LICENSE package/
           Compress-Archive -Path package/* -DestinationPath Myuri-windows-x64.zip
           $hash = (Get-FileHash Myuri-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  Myuri-windows-x64.zip" | Out-File -Encoding ascii Myuri-windows-x64.zip.sha256
+          [IO.File]::WriteAllText("$PWD/Myuri-windows-x64.zip.sha256", "$hash  Myuri-windows-x64.zip`n")
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

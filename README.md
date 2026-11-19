@@ -46,6 +46,7 @@
 **对话窗口**
 
 - 流式 Markdown，追问、停止、重试、复制
+- 模型分享思考过程时，折叠显示在回答上方，写明想了多久
 - 对话中随时切换模型和思考强度，只列当前模型支持的档位
 - 生图：选一个生图模型，调比例和质量，图片直接显示在窗口里
 - 语音：麦克风听写进输入框，回复可以朗读
@@ -59,6 +60,7 @@
 - 一个渠道可以存多把密钥，各自备注和停用；出问题换下一把、轮流用、同一对话固定一把，三种策略
 - 一键拉取渠道的模型列表并和本地比对
 - 内置模型能力目录（数据来自 models.dev），知道每个模型能不能看图、怎么控制思考
+- 渠道和模型自动配上厂商图标，也可以自己指定图标名、图片或网址
 
 **设置**
 
@@ -128,14 +130,14 @@ Myuri 没有服务器，也不收集任何数据。你选中的内容只会发�
 
 项目还很年轻，每天都在用也每天都在改。对话和生图用得最多；语音、Gemini 和 Anthropic 原生协议测得相对少。遇到问题欢迎提 [Issue](https://github.com/TheWiseWolfHolo/myuri/issues)。
 
-接下来要做的：显示模型的思考过程、对话历史、MCP 工具、WebDAV 同步、设置的导入导出。
+接下来要做的：对话历史、MCP 工具、WebDAV 同步、设置的导入导出。
 
 ## 致谢
 
 - [GPUI](https://www.gpui.rs/) 和 [gpui-kit](https://github.com/longbridge/gpui-kit)：界面框架和组件
 - [models.dev](https://models.dev)：模型能力数据
 - [Lucide](https://lucide.dev)：线条图标
-- [Lobe Icons](https://github.com/lobehub/lobe-icons)：模型和厂商图标的匹配规则
+- [Lobe Icons](https://github.com/lobehub/lobe-icons)：模型和厂商图标
 
 ## 许可证
 
