@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/myuri-core", "crates/myuri"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+repository = "https://github.com/TheWiseWolfHolo/myuri"
+
+[profile.dev]
+# GPUI apps are unusably slow with opt-level = 0.
+opt-level = 1
+debug = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

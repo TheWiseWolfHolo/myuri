@@ -1,0 +1,14 @@
+[package]
+name = "myuri-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1.2.1"
+pinyin = "0.11.0"
+regex = "1.13.2"
+serde_json = "1.0.154"
+toml_edit = "0.25"
