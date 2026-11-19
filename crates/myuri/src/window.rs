@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::text::{TextView, TextViewState};
@@ -86,6 +86,12 @@ struct Message {
     view: Option<Entity<TextViewState>>,
     /// A long user message shown in full.
     expanded: bool,
+    /// What the model thought before answering, where the provider shares it.
+    thoughts: String,
+    /// When the thinking began, and how long it took once the answer started.
+    thinking_since: Option<Instant>,
+    thought_for: Option<Duration>,
+    thoughts_open: bool,
 }
 
 pub struct ChatView {
@@ -319,6 +325,10 @@ impl ChatView {
             shots: Vec::new(),
             view,
             expanded: false,
+            thoughts: String::new(),
+            thinking_since: None,
+            thought_for: None,
+            thoughts_open: false,
         });
     }
 
@@ -409,15 +419,28 @@ impl ChatView {
             match event {
                 Event::Text(piece) => {
                     if let Some(reply) = self.messages.last_mut() {
+                        if reply.thought_for.is_none() {
+                            reply.thought_for = reply.thinking_since.map(|since| since.elapsed());
+                        }
                         reply.text.push_str(&piece);
                         if let Some(view) = &reply.view {
                             view.update(cx, |view, cx| view.push_str(&piece, cx));
                         }
                     }
                 }
-                Event::Reasoning(_) => {}
+                Event::Reasoning(piece) => {
+                    if let Some(reply) = self.messages.last_mut() {
+                        reply.thinking_since.get_or_insert_with(Instant::now);
+                        reply.thoughts.push_str(&piece);
+                    }
+                }
                 Event::Done => {
                     self.abort = None;
+                    if let Some(reply) = self.messages.last_mut() {
+                        if reply.thought_for.is_none() {
+                            reply.thought_for = reply.thinking_since.map(|since| since.elapsed());
+                        }
+                    }
                     self.drop_empty_reply();
                 }
                 Event::Error(reason) => {
@@ -511,7 +534,7 @@ impl ChatView {
     /// A reply with nothing in it would be sent back as an empty turn.
     fn drop_empty_reply(&mut self) {
         if self.messages.last().is_some_and(|m| {
-            m.role == Role::Assistant && m.text.is_empty() && m.shots.is_empty()
+            m.role == Role::Assistant && m.text.is_empty() && m.shots.is_empty() && m.thoughts.is_empty()
         }) {
             self.messages.pop();
         }
@@ -939,7 +962,7 @@ impl ChatView {
                     .into_any_element()
             }))
         } else if message.text.is_empty() {
-            body.child(waiting_dots(palette))
+            body.when(streaming, |body| body.child(waiting_dots(palette)))
         } else {
             body.children(message.view.as_ref().map(|view| TextView::new(view).selectable(true)))
         };
@@ -978,7 +1001,64 @@ impl ChatView {
                     )
                 })
         });
-        div().w_full().flex().flex_col().gap(px(4.0)).child(body).children(actions)
+        let thoughts = (!message.thoughts.is_empty()).then(|| {
+            let thinking = streaming && message.thought_for.is_none();
+            let label = match message.thought_for {
+                _ if thinking => "正在想".to_string(),
+                Some(spent) if spent.as_secs() >= 1 => format!("想了 {} 秒", spent.as_secs()),
+                _ => "想了一下".to_string(),
+            };
+            let open = message.thoughts_open;
+            let header = div()
+                .id(("thoughts", index))
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .ml(px(-6.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(7.0))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .text_color(palette.muted)
+                .hover(move |style| style.bg(palette.selected))
+                .child(svg().path("icons/lightbulb.svg").size(px(13.0)).text_color(palette.faint))
+                .child(label)
+                .child(
+                    svg()
+                        .path(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" })
+                        .size(px(12.0))
+                        .text_color(palette.faint),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(message) = this.messages.get_mut(index) {
+                        message.thoughts_open = !message.thoughts_open;
+                        cx.notify();
+                    }
+                }));
+            // While it thinks, the newest lines show under the header.
+            let shown = if open {
+                Some(message.thoughts.trim().to_string())
+            } else if thinking {
+                let tail: Vec<&str> = message.thoughts.trim().lines().rev().take(2).collect();
+                Some(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+            } else {
+                None
+            };
+            div().flex().flex_col().items_start().gap(px(4.0)).child(header).children(shown.map(|text| {
+                div()
+                    .w_full()
+                    .pl(px(10.0))
+                    .border_l_2()
+                    .border_color(palette.hairline)
+                    .text_size(px(12.5))
+                    .line_height(relative(1.6))
+                    .text_color(palette.muted)
+                    .when(!open, |text| text.line_clamp(2))
+                    .child(text)
+            }))
+        });
+        div().w_full().flex().flex_col().gap(px(4.0)).children(thoughts).child(body).children(actions)
     }
 
     fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

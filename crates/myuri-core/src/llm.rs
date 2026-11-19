@@ -123,6 +123,10 @@ pub fn build(api: Api, base_url: &str, key: &str, chat: &ChatRequest) -> HttpReq
             }
             if let Some(reasoning) = chat.reasoning {
                 body["reasoning"] = json!({ "effort": effort(reasoning) });
+                // Without this the thinking is not shared at all.
+                if reasoning != Reasoning::None {
+                    body["reasoning"]["summary"] = json!("auto");
+                }
             }
             ("/responses".into(), body)
         }
