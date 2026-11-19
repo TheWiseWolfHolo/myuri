@@ -50,6 +50,7 @@ pub const MENU_CONFIG: usize = 3;
 pub const MENU_LOG: usize = 4;
 pub const MENU_QUIT: usize = 5;
 pub const MENU_SETTINGS: usize = 6;
+pub const MENU_HISTORY: usize = 7;
 
 enum Command {
     Notify(String),
@@ -361,6 +362,7 @@ fn on_menu(choice: usize, paused: &AtomicBool, ui: &UiSender) {
         MENU_CONFIG => open(&config_dir().to_string_lossy()),
         MENU_LOG => open(&applog::path().to_string_lossy()),
         MENU_SETTINGS => ui.send(UiMsg::Settings),
+        MENU_HISTORY => ui.send(UiMsg::Page("history")),
         MENU_QUIT => ui.send(UiMsg::Quit),
         _ => {}
     }

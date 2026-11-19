@@ -9,6 +9,7 @@ mod chat;
 mod cli;
 mod clipboard;
 mod events;
+mod historyview;
 mod hook;
 mod icon;
 mod images;

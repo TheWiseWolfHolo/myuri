@@ -25,8 +25,26 @@ pub enum UiMsg {
     TrayMenu(Pos),
     /// Open the settings window, or bring it to the front.
     Settings,
+    /// Open the settings window on one of its pages, by name.
+    Page(&'static str),
+    /// Continue the saved conversation with this id in a new window.
+    Resume(String),
     Quit,
     Fatal(String),
+}
+
+static UI: std::sync::OnceLock<UiSender> = std::sync::OnceLock::new();
+
+/// Let windows reach the main loop with [`post`].
+pub fn install(ui: UiSender) {
+    let _ = UI.set(ui);
+}
+
+/// Send a message to the main loop from anywhere in the UI.
+pub fn post(message: UiMsg) {
+    if let Some(ui) = UI.get() {
+        ui.send(message);
+    }
 }
 
 #[derive(Clone)]

@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod config;
 pub mod edit;
 pub mod gesture;
+pub mod history;
 pub mod hotkey;
 pub mod image;
 pub mod llm;

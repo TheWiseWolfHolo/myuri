@@ -29,6 +29,7 @@ use crate::images;
 use crate::secrets;
 use crate::speech;
 use myuri_core::gesture::Pos;
+use myuri_core::history::{self, Conversation, Entry};
 use myuri_core::llm::{Event, Picture, Role, Turn};
 
 use crate::applog::info;
@@ -55,6 +56,8 @@ pub struct Opening {
     /// `[speech]` from config.toml: which provider/model listens and speaks.
     pub speech: SpeechSettings,
     pub catalog: Arc<Catalog>,
+    /// A saved conversation to continue.
+    pub resume: Option<Conversation>,
 }
 
 /// What is open above the input box.
@@ -144,6 +147,9 @@ pub struct ChatView {
     /// Transcribed text waiting for the next frame to type into the box.
     dictated: Option<String>,
     _subscriptions: Vec<Subscription>,
+    /// Under which id and creation time the conversation is saved.
+    conversation: String,
+    created: u64,
 }
 
 pub fn open(opening: Opening, cx: &mut App) {
@@ -265,8 +271,18 @@ impl ChatView {
             recorder: None,
             transcribing: false,
             dictated: None,
+            conversation: history::new_id(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis())
+                    .unwrap_or_default(),
+            ),
+            created: crate::historyview::now(),
             _subscriptions: subscriptions,
         };
+        if let Some(conversation) = opening.resume {
+            view.restore(conversation, cx);
+        }
         if let Some(content) = opening.content {
             let kind = content.kind();
             let (turn, thumb) = first_turn(content);
@@ -329,6 +345,68 @@ impl ChatView {
             thinking_since: None,
             thought_for: None,
             thoughts_open: false,
+        });
+    }
+
+    /// Put a saved conversation back on screen, to be continued.
+    fn restore(&mut self, conversation: Conversation, cx: &mut Context<Self>) {
+        use base64::Engine;
+        self.conversation = conversation.id;
+        self.created = conversation.created;
+        for entry in conversation.messages {
+            let role = if entry.role == "user" { Role::User } else { Role::Assistant };
+            let pictures: Vec<Picture> =
+                entry.pictures.into_iter().map(|(mime, base64)| Picture { mime, base64 }).collect();
+            let thumb = pictures.first().and_then(|picture| {
+                let bytes = base64::engine::general_purpose::STANDARD.decode(&picture.base64).ok()?;
+                gpui_image(&bytes)
+            });
+            self.push(Turn { role, text: entry.text, pictures }, thumb, cx);
+            if let Some(message) = self.messages.last_mut() {
+                message.thoughts = entry.thoughts;
+                message.shots = entry
+                    .shots
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .map(|path| Shot { thumb: std::fs::read(&path).ok().and_then(|bytes| gpui_image(&bytes)), path })
+                    .collect();
+            }
+        }
+    }
+
+    /// Save the conversation as it stands, off the UI thread.
+    fn remember(&self) {
+        let answered = self.messages.iter().any(|m| m.role == Role::Assistant);
+        if !answered {
+            return;
+        }
+        let conversation = Conversation {
+            id: self.conversation.clone(),
+            assistant: self.assistant.name.clone(),
+            model: self
+                .route
+                .as_ref()
+                .map(|route| format!("{}/{}", route.provider_id, route.model))
+                .unwrap_or_default(),
+            created: self.created,
+            updated: crate::historyview::now(),
+            messages: self
+                .messages
+                .iter()
+                .map(|m| Entry {
+                    role: if m.role == Role::User { "user" } else { "assistant" }.into(),
+                    text: m.text.clone(),
+                    thoughts: m.thoughts.clone(),
+                    pictures: m.pictures.iter().map(|p| (p.mime.clone(), p.base64.clone())).collect(),
+                    shots: m.shots.iter().map(|shot| shot.path.display().to_string()).collect(),
+                })
+                .collect(),
+        };
+        let dir = crate::config_dir();
+        std::thread::spawn(move || {
+            if let Err(error) = history::save(&dir, &conversation) {
+                info!("history: cannot save: {error}");
+            }
         });
     }
 
@@ -442,6 +520,7 @@ impl ChatView {
                         }
                     }
                     self.drop_empty_reply();
+                    self.remember();
                 }
                 Event::Error(reason) => {
                     self.abort = None;
@@ -522,6 +601,7 @@ impl ChatView {
                     self.drop_empty_reply();
                 } else if let Some(reply) = self.messages.last_mut() {
                     reply.shots = shots;
+                    self.remember();
                 }
             }
         }
@@ -548,6 +628,8 @@ impl ChatView {
         // Whatever the stopped request still delivers belongs to nobody.
         self.generation += 1;
         self.drop_empty_reply();
+        // What arrived before the stop is kept.
+        self.remember();
         cx.notify();
     }
 
@@ -862,6 +944,11 @@ impl ChatView {
                     }),
                 ))
             })
+            .child(
+                icon_button("history", "icons/history.svg", palette.faint, palette.selected)
+                    .occlude()
+                    .on_click(|_, _, _| crate::events::post(crate::events::UiMsg::Page("history"))),
+            )
             .child(
                 icon_button("close", "icons/x.svg", palette.muted, palette.selected)
                     .occlude()

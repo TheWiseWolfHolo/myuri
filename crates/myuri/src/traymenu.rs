@@ -31,8 +31,9 @@ const PADDING: f32 = 6.0;
 /// A row of the menu; `None` is a dividing line.
 type Entry = Option<(usize, &'static str, &'static str)>;
 
-const ENTRIES: [Entry; 9] = [
+const ENTRIES: [Entry; 10] = [
     Some((tray::MENU_SETTINGS, "icons/settings.svg", "设置")),
+    Some((tray::MENU_HISTORY, "icons/history.svg", "对话历史")),
     None,
     Some((tray::MENU_PAUSE, "icons/mouse-pointer-click.svg", "暂停右键手势")),
     Some((tray::MENU_AUTOSTART, "icons/power.svg", "开机自启")),

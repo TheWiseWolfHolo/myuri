@@ -44,6 +44,7 @@ pub fn run() {
 
     let (tx, rx) = async_channel::unbounded();
     let ui = UiSender(tx);
+    crate::events::install(ui.clone());
     let paused = Arc::new(AtomicBool::new(false));
     let tray = tray::spawn(paused.clone(), ui.clone());
     let capture = capture::spawn((&settings.capture).into(), ui.clone());
@@ -126,8 +127,16 @@ impl Running {
                 self.panel.update(cx, |panel, _, cx| panel.released(press, cx));
             }
             UiMsg::Chosen { assistant, content, anchor } => {
-                self.open_assistant(&assistant, content, anchor, cx);
+                self.open_assistant(&assistant, content, anchor, None, cx);
             }
+            UiMsg::Resume(id) => {
+                if let Some(conversation) = myuri_core::history::load(&self.dir, &id) {
+                    let name = conversation.assistant.clone();
+                    let anchor = crate::win::cursor_pos();
+                    self.open_assistant(&name, None, anchor, Some(conversation), cx);
+                }
+            }
+            UiMsg::Page(page) => self.show_settings(Some(page), cx),
             UiMsg::Dismiss => self.panel.update(cx, |panel, _, cx| panel.dismiss(cx)),
             UiMsg::Preview(kind) => {
                 self.panel.update(cx, |panel, window, cx| panel.preview(kind, window, cx));
@@ -139,17 +148,7 @@ impl Running {
                 let dark = theme::is_dark(self.settings.panel.theme, cx.window_appearance());
                 crate::traymenu::open(at, dark, self.tray.clone(), cx);
             }
-            UiMsg::Settings => {
-                // An open window comes to the front; a closed one no longer answers.
-                let shown = self.settings_window.is_some_and(|window| {
-                    window.update(cx, |_, window, _| window.activate_window()).is_ok()
-                });
-                if !shown {
-                    let dark = theme::is_dark(self.settings.panel.theme, cx.window_appearance());
-                    theme::apply_to_components(dark, cx);
-                    self.settings_window = crate::settings::open(self.dir.clone(), dark, cx);
-                }
-            }
+            UiMsg::Settings => self.show_settings(None, cx),
             UiMsg::ConfigChanged => self.reload(cx),
             UiMsg::Quit => {
                 info!("quit");
@@ -166,12 +165,47 @@ impl Running {
         false
     }
 
-    fn open_assistant(&mut self, name: &str, content: Option<Content>, anchor: Pos, cx: &mut App) {
-        let Some(assistant) = self.assistants.iter().find(|a| a.name == name).cloned() else { return };
+    /// Open the settings window, or bring it to the front, on `page` if given.
+    fn show_settings(&mut self, page: Option<&'static str>, cx: &mut App) {
+        // An open window comes to the front; a closed one no longer answers.
+        let shown = self.settings_window.is_some_and(|window| {
+            window
+                .update(cx, |view, window, cx| {
+                    if let (Some(page), Ok(view)) = (page, view.downcast::<crate::settings::SettingsView>()) {
+                        view.update(cx, |view, cx| view.show_page(page, window, cx));
+                    }
+                    window.activate_window();
+                })
+                .is_ok()
+        });
+        if !shown {
+            let dark = theme::is_dark(self.settings.panel.theme, cx.window_appearance());
+            theme::apply_to_components(dark, cx);
+            self.settings_window = crate::settings::open(self.dir.clone(), dark, page, cx);
+        }
+    }
+
+    fn open_assistant(
+        &mut self,
+        name: &str,
+        content: Option<Content>,
+        anchor: Pos,
+        resume: Option<myuri_core::history::Conversation>,
+        cx: &mut App,
+    ) {
+        // A conversation whose assistant is gone continues with the first one.
+        let found = self.assistants.iter().find(|a| a.name == name);
+        let fallback = resume.as_ref().and_then(|_| self.assistants.first());
+        let Some(assistant) = found.or(fallback).cloned() else { return };
         // Read from disk each time, so edits apply to the next window.
         let providers = config::load_providers(&self.dir);
+        let last_model = resume.as_ref().and_then(|conversation| config::ModelRef::parse(&conversation.model));
         let route = match &providers {
-            Ok(providers) => Route::find(&self.settings, providers, &assistant),
+            // A continued conversation stays on the model it last used.
+            Ok(providers) => last_model
+                .and_then(|model| Route::to(providers, &model).ok())
+                .map(Ok)
+                .unwrap_or_else(|| Route::find(&self.settings, providers, &assistant)),
             Err(problem) => Err(problem.to_string()),
         };
         let dark = theme::is_dark(self.settings.panel.theme, cx.window_appearance());
@@ -187,6 +221,7 @@ impl Running {
             assistant,
             route,
             content,
+            resume,
         };
         window::open(opening, cx);
     }

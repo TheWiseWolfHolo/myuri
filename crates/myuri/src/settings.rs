@@ -40,6 +40,7 @@ enum Tab {
     Images,
     Speech,
     General,
+    History,
 }
 
 impl Tab {
@@ -48,7 +49,7 @@ impl Tab {
             Self::Chat => Some(Purpose::Chat),
             Self::Images => Some(Purpose::Images),
             Self::Speech => Some(Purpose::Speech),
-            Self::Assistants | Self::General => None,
+            Self::Assistants | Self::General | Self::History => None,
         }
     }
 
@@ -59,6 +60,7 @@ impl Tab {
             Self::Images => "images",
             Self::Speech => "speech",
             Self::General => "general",
+            Self::History => "history",
         }
     }
 
@@ -69,8 +71,14 @@ impl Tab {
             "images" => Self::Images,
             "speech" => Self::Speech,
             "general" => Self::General,
+            "history" => Self::History,
             _ => return None,
         })
+    }
+
+    /// The page is a view of its own instead of a list and a form.
+    fn own_page(self) -> bool {
+        matches!(self, Self::History)
     }
 }
 
@@ -145,6 +153,7 @@ pub struct SettingsView {
     picker_open: bool,
     /// The picker is choosing the default model rather than an assistant's.
     picker_default: bool,
+    history: Entity<crate::historyview::HistoryView>,
     /// `[models] default`: what assistants without a model use.
     default_model: Entity<InputState>,
     prompt: Entity<TextareaState>,
@@ -195,7 +204,12 @@ pub struct SettingsView {
 
 /// Open the settings window. Returns its handle, for bringing it to the
 /// front the next time.
-pub fn open(dir: PathBuf, dark: bool, cx: &mut App) -> Option<gpui_kit::AnyWindowHandle> {
+pub fn open(
+    dir: PathBuf,
+    dark: bool,
+    page: Option<&'static str>,
+    cx: &mut App,
+) -> Option<gpui_kit::AnyWindowHandle> {
     let remembered = uistate::load(&dir);
     let extent = if remembered.window.width > 0.0 && remembered.window.height > 0.0 {
         size(px(remembered.window.width), px(remembered.window.height))
@@ -217,7 +231,13 @@ pub fn open(dir: PathBuf, dark: bool, cx: &mut App) -> Option<gpui_kit::AnyWindo
         ..Default::default()
     };
     gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(dir, dark, window, cx))
+        cx.new(|cx| {
+            let mut view = SettingsView::new(dir, dark, window, cx);
+            if let Some(page) = page {
+                view.show_page(page, window, cx);
+            }
+            view
+        })
     })
     .ok()
     .map(|(handle, _)| handle)
@@ -256,7 +276,12 @@ impl SettingsView {
         let tts_models = list("一行一个模型名");
         let voice = line("语音的音色，如声音 id", window, cx);
         let remembered = uistate::load(&dir);
+        let history = {
+            let dir = dir.clone();
+            cx.new(|cx| crate::historyview::HistoryView::new(dir, theme::palette(dark), window, cx))
+        };
         let mut view = Self {
+            history,
             catalog: std::sync::Arc::new(models::load(&dir)),
             dir,
             palette: theme::palette(dark),
@@ -941,6 +966,26 @@ impl SettingsView {
         self.finish(outcome, window, cx);
     }
 
+    fn switch_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = tab;
+        self.status = None;
+        self.confirm = None;
+        self.close_picker(cx);
+        self.pick_provider(window, cx);
+        if tab == Tab::History {
+            self.history.update(cx, |history, cx| history.refresh(cx));
+        }
+        self.save_ui_state();
+        cx.notify();
+    }
+
+    /// Go to a page by its name, as other windows ask for it.
+    pub fn show_page(&mut self, page: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = Tab::named(page) {
+            self.switch_tab(tab, window, cx);
+        }
+    }
+
     fn nav(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let palette = self.palette;
         let entries = [
@@ -949,6 +994,7 @@ impl SettingsView {
             (Tab::Images, "icons/image.svg", "生图"),
             (Tab::Speech, "icons/audio-lines.svg", "语音"),
             (Tab::General, "icons/sliders-horizontal.svg", "通用"),
+            (Tab::History, "icons/history.svg", "历史"),
         ];
         div()
             .w(px(150.0))
@@ -969,15 +1015,7 @@ impl SettingsView {
                         palette.muted
                     }))
                     .child(label)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.tab = tab;
-                        this.status = None;
-                        this.confirm = None;
-                        this.close_picker(cx);
-                        this.pick_provider(window, cx);
-                        this.save_ui_state();
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| this.switch_tab(tab, window, cx)))
             }))
     }
 
@@ -986,7 +1024,7 @@ impl SettingsView {
         let query = self.search.read(cx).value().trim().to_lowercase();
         let found = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
         let rows: Vec<AnyElement> = match self.tab {
-            Tab::General => return None,
+            Tab::General | Tab::History => return None,
             Tab::Assistants => self
                 .assistants
                 .iter()
@@ -1913,6 +1951,12 @@ impl Render for SettingsView {
             Tab::Assistants => self.assistant_form(cx),
             Tab::Chat | Tab::Images | Tab::Speech => self.provider_form(cx),
             Tab::General => self.general_form(cx),
+            Tab::History => Vec::new(),
+        };
+        // Pages that are views of their own fill everything right of the nav.
+        let page = match self.tab {
+            Tab::History => Some(div().flex_1().min_w(px(0.0)).h_full().child(self.history.clone())),
+            _ => None,
         };
         let title = div()
             .h(px(44.0))
@@ -1964,7 +2008,8 @@ impl Render for SettingsView {
                     .flex()
                     .child(self.nav(cx))
                     .children(self.list(cx))
-                    .child(
+                    .children(page)
+                    .when(!self.tab.own_page(), |body| body.child(
                         div()
                             .id("form")
                             .flex_1()
@@ -1978,7 +2023,7 @@ impl Render for SettingsView {
                             .flex_col()
                             .gap(px(18.0))
                             .children(form),
-                    ),
+                    )),
             )
     }
 }
