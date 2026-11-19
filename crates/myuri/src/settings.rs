@@ -1046,7 +1046,7 @@ impl SettingsView {
             (Tab::Speech, "icons/audio-lines.svg", "语音"),
             (Tab::Tools, "icons/wrench.svg", "工具"),
             (Tab::General, "icons/sliders-horizontal.svg", "通用"),
-            (Tab::History, "icons/history.svg", "历史"),
+            (Tab::History, "icons/clock.svg", "历史"),
             (Tab::Sync, "icons/cloud-upload.svg", "同步"),
         ];
         div()

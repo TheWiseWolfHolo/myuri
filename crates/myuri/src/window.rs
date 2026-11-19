@@ -1199,7 +1199,7 @@ impl ChatView {
                 ))
             })
             .child(
-                icon_button("history", "icons/history.svg", palette.faint, palette.selected)
+                icon_button("history", "icons/clock.svg", palette.faint, palette.selected)
                     .occlude()
                     .on_click(|_, _, _| crate::events::post(crate::events::UiMsg::Page("history"))),
             )

@@ -75,8 +75,21 @@ at the mouse; say so instead of claiming they were verified.
   (`picker.rs`), `ui-state.toml` for window state, and brand icons
   (`myuri-core/src/brand.rs` rules, `myuri/src/brand.rs` download and cache;
   `tools/lobehub-map.py` regenerates `assets/lobehub.json`).
-- Not done yet: history, MCP tools and skills, WebDAV sync, settings
-  import/export.
+- Also done: saved conversations (`myuri-core/src/history.rs`, the history
+  page `historyview.rs`, resume through `UiMsg::Resume`), backup to a file or
+  WebDAV with keys sealed by a password (`myuri-core/src/backup.rs`,
+  `syncview.rs`), and tools: tool calls in all four dialects (`llm.rs`:
+  `Tool`, `ToolCall`, `Event::Call`, `echo` carries what a provider wants
+  handed back), MCP over stdio and HTTP plus skills (`myuri-core/src/mcp.rs`
+  for config and wording, `myuri/src/mcp.rs` for sessions and `Kit`), the tool
+  loop with confirmation in `window.rs` (`advance`, `run_call`, `decide`) and
+  the tools page `toolsview.rs`.
+- Settings pages that are views of their own (history, sync, tools) are
+  entities held by `SettingsView`; `Tab::own_page` switches the layout.
+  Windows reach the main loop with `events::post`.
+- To exercise UI without touching the user's data, run the debug build with
+  `APPDATA` pointing at a scratch folder (quit the running instance first),
+  and fake servers on localhost for providers, MCP and WebDAV.
 - The repository is public at github.com/TheWiseWolfHolo/myuri. Nothing
   personal goes into commits: no provider names, keys, paths or screenshots of
   the user's own setup. CI runs on every push; pushing a tag `vX.Y.Z` that

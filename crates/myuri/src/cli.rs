@@ -28,7 +28,9 @@ const USAGE: &str = "\
   myuri models fetch --all [--sync] 所有启用的供应商
   myuri models fetch <供应商 id> --sync --keep gpt,codex   只要名字里带这些词的
   myuri key <供应商 id>             从标准输入读一行密钥，存进 Windows 凭据管理器
-  myuri key <供应商 id> --delete    删掉存着的密钥";
+  myuri key <供应商 id> --delete    删掉存着的密钥
+  myuri mcp <服务名>                启动 mcp.toml 里的一个服务，列出它的工具
+  myuri mcp <服务名> <工具> [JSON]  调用它的一个工具";
 
 /// Returns the exit code, or `None` to start the application.
 pub fn dispatch(args: &[String]) -> Option<i32> {
@@ -54,6 +56,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         ("ask", Some(assistant)) => ask(assistant, &args[2..]),
         ("models", Some(action)) => models_command(action, &args[2..]),
         ("key", Some(provider)) => key(provider, args.get(2).map(String::as_str)),
+        ("mcp", Some(server)) => mcp_command(server, &args[2..]),
         ("help" | "--help" | "-h", _) => {
             println!("{USAGE}");
             0
@@ -255,6 +258,53 @@ fn picture(provider: &str, rest: &[String]) -> i32 {
     match outcome {
         Ok(paths) => {
             paths.iter().for_each(|path| println!("{}", path.display()));
+            0
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            1
+        }
+    }
+}
+
+/// Start an MCP server from `mcp.toml` and list its tools, or call one.
+fn mcp_command(name: &str, rest: &[String]) -> i32 {
+    let servers = match myuri_core::mcp::load_servers(&crate::config_dir()) {
+        Ok(servers) => servers,
+        Err(problem) => {
+            eprintln!("{problem}");
+            return 1;
+        }
+    };
+    let Some(server) = servers.iter().find(|server| server.name == name) else {
+        eprintln!("mcp.toml 里没有叫 {name} 的服务");
+        return 1;
+    };
+    let outcome = match rest {
+        [] => crate::mcp::probe(server).map(|tools| tools.join("
+")),
+        [tool, arguments @ ..] => {
+            // An assistant that lists just this server gets exactly its tools.
+            let written = format!("[[assistant]]
+name = \"mcp\"
+tools = [{name:?}]
+");
+            config::parse_assistants(&written).and_then(|assistants| {
+                let kit = crate::mcp::Kit::gather(&crate::config_dir(), &assistants[0]);
+                match kit.problems.first() {
+                    Some(problem) => Err(problem.clone()),
+                    None => kit.call(
+                        &myuri_core::mcp::tool_name(name, tool),
+                        arguments.first().map(String::as_str).unwrap_or("{}"),
+                    ),
+                }
+            })
+        }
+    };
+    crate::mcp::stop_all();
+    match outcome {
+        Ok(text) => {
+            println!("{text}");
             0
         }
         Err(reason) => {
