@@ -368,6 +368,16 @@ impl Render for ModelPicker {
                     provider.name.clone()
                 }
             };
+            let mark = match shelf {
+                Shelf::Favorites => None,
+                Shelf::Provider(index) => Some(crate::brand::avatar(
+                    crate::brand::provider(&self.providers[index], palette.ink),
+                    &label,
+                    14.0,
+                    palette.hairline,
+                    palette.muted,
+                )),
+            };
             let open = shelf == self.shelf;
             if open && self.reveal_shelf.take() {
                 self.shelves_scroll.scroll_to_item(column.len());
@@ -378,6 +388,7 @@ impl Render for ModelPicker {
                     .when(shelf == Shelf::Favorites, |row| {
                         row.child(svg().path("icons/star.svg").size(px(13.0)).flex_none().text_color(palette.accent))
                     })
+                    .children(mark)
                     .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
                     .child(
                         div()
@@ -424,7 +435,11 @@ impl Render for ModelPicker {
                         let mark = |icon: &'static str| {
                             svg().path(icon).size(px(12.0)).flex_none().text_color(palette.faint)
                         };
+                        // A model nobody recognizes takes its provider's icon.
+                        let brand = crate::brand::model(&entry.name, palette.ink)
+                            .or_else(|| crate::brand::provider(source, palette.ink));
                         sheet_row(("model", row), palette, row == this.picked)
+                            .child(crate::brand::avatar(brand, &source.name, 15.0, palette.hairline, palette.muted))
                             .child(div().flex_1().min_w(px(0.0)).truncate().child(entry.name.clone()))
                             .when(entry.vision, |el| el.child(mark("icons/eye.svg")))
                             .when(entry.reasoning, |el| el.child(mark("icons/brain.svg")))

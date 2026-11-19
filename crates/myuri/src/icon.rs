@@ -1,6 +1,7 @@
 //! Assistant icons. The `icon` setting may name a line icon from the bundled
 //! Lucide set ("languages"), point at an image in the configuration folder
-//! ("icons/a.png"), or simply be a character or an emoji.
+//! ("icons/a.png"), name a brand icon from Lobe Icons ("openai"), or simply
+//! be a character or an emoji.
 
 use std::path::PathBuf;
 
@@ -19,6 +20,8 @@ pub enum Glyph {
     Picture(PathBuf),
     /// Asset path of a line icon.
     Line(SharedString),
+    /// File name of a brand icon, such as "openai" or "gemini-color".
+    Brand(String),
     Text(SharedString),
 }
 
@@ -33,6 +36,8 @@ impl Glyph {
             }
         } else if let Some(path) = line_icon(icon) {
             return Self::Line(path);
+        } else if let Some(name) = crate::brand::named(icon) {
+            return Self::Brand(name);
         } else if !icon.is_empty() && !icon.contains(['/', '\\']) {
             return Self::Text(icon.to_string().into());
         }
@@ -50,6 +55,10 @@ impl Glyph {
                 .into_any_element(),
             Self::Line(path) => frame
                 .child(svg().path(path.clone()).size(px(size * 0.8)).text_color(color))
+                .into_any_element(),
+            // Until the picture is downloaded the square stays empty.
+            Self::Brand(name) => frame
+                .children(crate::brand::by_name(name, color).map(|image| crate::brand::badge(image, size * 0.8)))
                 .into_any_element(),
             Self::Text(text) => frame
                 .font(theme::serif())

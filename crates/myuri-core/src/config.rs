@@ -28,6 +28,7 @@ pub const DEFAULT_PROVIDERS: &str = r#"# 模型供应商。保存后立即生效
 # base_url = "https://api.openai.com/v1"
 # models = ["gpt-4o-mini"]               # 可选，供切换模型时挑选
 # group = "原厂"                         # 可选，切换模型时按它分组
+# icon = "openai"                        # 可选，不写就自动匹配；Lobe Icons 的名字、图片路径或网址
 # speech_api = "elevenlabs"              # 语音接口：elevenlabs、soniox、openai
 # asr_models = ["scribe_v3"]             # 语音识别模型
 # tts_models = ["eleven_v4"]             # 语音合成模型
@@ -511,6 +512,11 @@ pub struct Provider {
     /// The voice a speech model speaks with, when it offers several.
     #[serde(default)]
     pub voice: String,
+    /// Left out, the icon is matched from the id, name and address. Otherwise
+    /// a Lobe Icons name ("openai", "gemini-color"), a picture in the
+    /// configuration folder, or a web address.
+    #[serde(default)]
+    pub icon: String,
     #[serde(default = "yes")]
     pub enabled: bool,
 }

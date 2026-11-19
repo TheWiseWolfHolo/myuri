@@ -3,6 +3,7 @@
 mod app;
 mod applog;
 mod autostart;
+mod brand;
 mod capture;
 mod chat;
 mod cli;

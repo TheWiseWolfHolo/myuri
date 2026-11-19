@@ -155,6 +155,7 @@ pub struct SettingsView {
     provider_name: Entity<InputState>,
     base_url: Entity<InputState>,
     group: Entity<InputState>,
+    provider_icon: Entity<InputState>,
     /// The keys of the open provider, in the order the credential stores them.
     key_rows: Vec<KeyRow>,
     /// Appends a key for a normal provider, replaces the JSON for a Vertex one.
@@ -233,6 +234,7 @@ impl SettingsView {
         let provider_name = line("显示的名字", window, cx);
         let base_url = line("https://api.example.com/v1", window, cx);
         let group = line("切换模型时归在哪个分组下", window, cx);
+        let provider_icon = line("自动匹配；可填 openai、gemini-color 这样的名字、图片路径或网址", window, cx);
         let new_key =
             cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("粘贴密钥或服务账号 JSON"));
         let hold = line("220", window, cx);
@@ -283,6 +285,7 @@ impl SettingsView {
             provider_name,
             base_url,
             group,
+            provider_icon,
             key_rows: Vec::new(),
             new_key,
             api: Api::ChatCompletions,
@@ -404,6 +407,7 @@ impl SettingsView {
         self.provider_name.update(cx, |input, cx| input.set_value(provider.name.clone(), window, cx));
         self.base_url.update(cx, |input, cx| input.set_value(provider.base_url.clone(), window, cx));
         self.group.update(cx, |input, cx| input.set_value(provider.group.clone(), window, cx));
+        self.provider_icon.update(cx, |input, cx| input.set_value(provider.icon.clone(), window, cx));
         self.new_key.update(cx, |input, cx| input.set_value("", window, cx));
         self.api = provider.api;
         self.image_api = provider.image_api();
@@ -560,6 +564,7 @@ impl SettingsView {
             ("name", Field::optional(&read(&self.provider_name))),
             ("base_url", Field::Text(read(&self.base_url))),
             ("group", Field::optional(&read(&self.group))),
+            ("icon", Field::optional(&read(&self.provider_icon))),
             ("key_strategy", strategy),
             ("enabled", if self.provider_enabled { Field::Absent } else { Field::Flag(false) }),
         ];
@@ -1100,6 +1105,13 @@ impl SettingsView {
                             .on_drop(cx.listener(move |this, dragged: &DragProvider, window, cx| {
                                 this.drop_provider(dragged.0, index, window, cx);
                             }))
+                            .child(crate::brand::avatar(
+                                crate::brand::provider(provider, palette.ink),
+                                name,
+                                16.0,
+                                palette.hairline,
+                                palette.muted,
+                            ))
                             .child(div().flex_1().min_w(px(0.0)).truncate().child(name.clone()))
                             .child(
                                 div()
@@ -1453,6 +1465,7 @@ impl SettingsView {
         })
         .chain([
             field("分组", boxed(Input::new(&self.group).appearance(false), palette), palette),
+            field("图标", boxed(Input::new(&self.provider_icon).appearance(false), palette), palette),
             field("密钥", self.keys_field(provider, cx), palette),
             field("多把密钥怎么用", div().flex().flex_wrap().gap(px(6.0)).children(strategy), palette),
         ])

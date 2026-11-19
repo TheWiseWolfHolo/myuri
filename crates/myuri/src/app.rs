@@ -33,6 +33,9 @@ pub fn run() {
         problems.push(problem);
         Settings::default()
     });
+    if let Ok(providers) = config::load_providers(&dir) {
+        crate::brand::prefetch(&providers);
+    }
     let assistants = config::load_assistants(&dir).unwrap_or_else(|problem| {
         problems.push(problem);
         config::parse_assistants(config::DEFAULT_ASSISTANTS).unwrap_or_default()
@@ -227,6 +230,9 @@ impl Running {
                 }
             }
             Err(problem) => self.report(problem),
+        }
+        if let Ok(providers) = config::load_providers(&self.dir) {
+            crate::brand::prefetch(&providers);
         }
     }
 

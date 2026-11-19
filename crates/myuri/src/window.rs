@@ -1093,6 +1093,12 @@ impl ChatView {
             Ok(route) => route.model.clone(),
             Err(_) => "选择模型".to_string(),
         };
+        let brand = self
+            .route
+            .as_ref()
+            .ok()
+            .and_then(|route| crate::brand::model(&route.model, palette.ink))
+            .map(|image| crate::brand::badge(image, 14.0));
         let picture = self.picture_mode();
         let (levels, switch_only) = self.reasoning_levels();
         let fitted = self.reasoning.map(|level| catalog::nearest(&levels, level).unwrap_or(level));
@@ -1104,7 +1110,7 @@ impl ChatView {
             .items_center()
             .gap(px(2.0))
             .child(
-                chip("model", None, model, palette, self.sheet == Sheet::Models).on_click(
+                chip_with("model", brand, model, palette, self.sheet == Sheet::Models).on_click(
                     cx.listener(|this, _, window, cx| this.chip_clicked(Sheet::Models, window, cx)),
                 ),
             )
@@ -1331,6 +1337,20 @@ fn chip(
     palette: Palette,
     open: bool,
 ) -> Stateful<Div> {
+    let icon = icon.map(|icon| {
+        svg().path(icon).size(px(13.0)).flex_none().text_color(palette.muted).into_any_element()
+    });
+    chip_with(id, icon, label, palette, open)
+}
+
+/// A chip led by any small element, such as a brand icon.
+fn chip_with(
+    id: &'static str,
+    lead: Option<gpui_kit::AnyElement>,
+    label: String,
+    palette: Palette,
+    open: bool,
+) -> Stateful<Div> {
     div()
         .id(id)
         .h(px(26.0))
@@ -1345,7 +1365,7 @@ fn chip(
         .text_color(palette.muted)
         .when(open, |chip| chip.bg(palette.selected))
         .hover(move |style| style.bg(palette.selected))
-        .children(icon.map(|icon| svg().path(icon).size(px(13.0)).flex_none().text_color(palette.muted)))
+        .children(lead)
         .child(div().min_w(px(0.0)).truncate().child(label))
         .child(svg().path("icons/chevron-down.svg").size(px(12.0)).flex_none().text_color(palette.faint))
 }
