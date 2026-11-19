@@ -70,9 +70,18 @@ at the mouse; say so instead of claiming they were verified.
   (`speech_api`, `asr_models`, `tts_models`); `Provider::serves` decides which
   settings page lists it. Settings edits go through `myuri-core/src/edit.rs`
   (toml_edit, comments kept; reordering must reset table positions).
-- Not done yet: pictures and speech inside the assistant window, the speech
-  calls themselves (ElevenLabs, Soniox models are configured), MCP tools and
-  skills, showing the model's thinking, history, WebDAV sync.
+- Also done: pictures and speech in the assistant window (`speech.rs` in both
+  crates), the model's thinking shown above its reply, a shared model picker
+  (`picker.rs`), `ui-state.toml` for window state, and brand icons
+  (`myuri-core/src/brand.rs` rules, `myuri/src/brand.rs` download and cache;
+  `tools/lobehub-map.py` regenerates `assets/lobehub.json`).
+- Not done yet: history, MCP tools and skills, WebDAV sync, settings
+  import/export.
+- The repository is public at github.com/TheWiseWolfHolo/myuri. Nothing
+  personal goes into commits: no provider names, keys, paths or screenshots of
+  the user's own setup. CI runs on every push; pushing a tag `vX.Y.Z` that
+  matches the workspace version builds and publishes a release. The branch
+  `local-history` holds the pre-publication history and is never pushed.
 - Only chat completions has been exercised against a real endpoint. Responses,
   Anthropic and Gemini have unit tests only.
 - `dist/myuri.exe` is the copy the user runs day to day. Rebuild into
