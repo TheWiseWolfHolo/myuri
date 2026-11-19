@@ -110,7 +110,7 @@ fn ask(name: &str, words: &[String]) -> i32 {
     let catalog = models::load(&dir);
     let info = catalog.lookup(&route.model);
     let (tx, rx) = std::sync::mpsc::channel();
-    let _abort = route.send(&system, &turns, assistant.reasoning, assistant.temperature, info, move |event| {
+    let _abort = route.send(&system, &turns, assistant.reasoning, assistant.temperature, info, &[], move |event| {
         let _ = tx.send(event);
     });
     let mut out = std::io::stdout();
@@ -119,7 +119,7 @@ fn ask(name: &str, words: &[String]) -> i32 {
             llm::Event::Text(text) => {
                 let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
             }
-            llm::Event::Reasoning(_) => {}
+            llm::Event::Reasoning(_) | llm::Event::Call(_) => {}
             llm::Event::Done => {
                 println!();
                 return 0;

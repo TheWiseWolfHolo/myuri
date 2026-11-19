@@ -20,22 +20,62 @@ pub struct Picture {
     pub base64: String,
 }
 
+/// Something the model may ask the program to do for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tool {
+    /// Letters, digits, `_` and `-` only: that is all providers accept.
+    pub name: String,
+    pub description: String,
+    /// JSON Schema of the arguments.
+    pub schema: Value,
+}
+
+/// The model asking for a tool.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// The arguments as the text of a JSON object.
+    pub arguments: String,
+    /// What the provider wants handed back along with the call: reasoning
+    /// items, signed thinking blocks, a thought signature.
+    pub echo: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolResult {
+    /// The id of the call this answers.
+    pub id: String,
+    pub name: String,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Turn {
     pub role: Role,
     pub text: String,
     /// Only meaningful on user turns.
     pub pictures: Vec<Picture>,
+    /// Tools the assistant asked for in this turn.
+    pub calls: Vec<ToolCall>,
+    /// What the tools answered. A user turn carrying these follows the turn
+    /// with the calls; its text and pictures are not sent.
+    pub results: Vec<ToolResult>,
 }
 
 impl Turn {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), pictures: Vec::new() }
+        Self { role: Role::User, text: text.into(), pictures: Vec::new(), calls: Vec::new(), results: Vec::new() }
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), pictures: Vec::new() }
+        Self { role: Role::Assistant, text: text.into(), pictures: Vec::new(), calls: Vec::new(), results: Vec::new() }
     }
+}
+
+/// Arguments as a JSON object, whatever the model wrote.
+fn arguments(text: &str) -> Value {
+    serde_json::from_str::<Value>(text).ok().filter(Value::is_object).unwrap_or_else(|| json!({}))
 }
 
 pub struct ChatRequest<'a> {
@@ -47,6 +87,8 @@ pub struct ChatRequest<'a> {
     /// What the catalog knows about the model, to pick the right way of
     /// asking for reasoning.
     pub info: Option<&'a ModelInfo>,
+    /// Tools the model may call.
+    pub tools: &'a [Tool],
 }
 
 #[derive(Debug, PartialEq)]
@@ -77,6 +119,12 @@ pub fn build(api: Api, base_url: &str, key: &str, chat: &ChatRequest) -> HttpReq
                 messages.push(json!({ "role": "system", "content": chat.system }));
             }
             for turn in chat.turns {
+                if !turn.results.is_empty() {
+                    for result in &turn.results {
+                        messages.push(json!({ "role": "tool", "tool_call_id": result.id, "content": result.text }));
+                    }
+                    continue;
+                }
                 let content = if turn.pictures.is_empty() {
                     json!(turn.text)
                 } else {
@@ -90,9 +138,37 @@ pub fn build(api: Api, base_url: &str, key: &str, chat: &ChatRequest) -> HttpReq
                     json!(parts)
                 };
                 let role = if turn.role == Role::User { "user" } else { "assistant" };
-                messages.push(json!({ "role": role, "content": content }));
+                let mut message = json!({ "role": role, "content": content });
+                if !turn.calls.is_empty() {
+                    let calls: Vec<Value> = turn
+                        .calls
+                        .iter()
+                        .map(|call| {
+                            json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": { "name": call.name, "arguments": call.arguments },
+                            })
+                        })
+                        .collect();
+                    message["tool_calls"] = json!(calls);
+                }
+                messages.push(message);
             }
             let mut body = json!({ "model": chat.model, "stream": true, "messages": messages });
+            if !chat.tools.is_empty() {
+                let tools: Vec<Value> = chat
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "type": "function",
+                            "function": { "name": tool.name, "description": tool.description, "parameters": tool.schema },
+                        })
+                    })
+                    .collect();
+                body["tools"] = json!(tools);
+            }
             if let Some(reasoning) = chat.reasoning {
                 body["reasoning_effort"] = json!(effort(reasoning));
             }
@@ -100,24 +176,59 @@ pub fn build(api: Api, base_url: &str, key: &str, chat: &ChatRequest) -> HttpReq
         }
         Api::Responses => {
             headers.push(("authorization".into(), format!("Bearer {key}")));
-            let input: Vec<Value> = chat
-                .turns
-                .iter()
-                .map(|turn| {
-                    if turn.role == Role::Assistant {
-                        return json!({ "role": "assistant", "content": [{ "type": "output_text", "text": turn.text }] });
+            let mut input: Vec<Value> = Vec::new();
+            for turn in chat.turns {
+                if !turn.results.is_empty() {
+                    for result in &turn.results {
+                        input.push(json!({ "type": "function_call_output", "call_id": result.id, "output": result.text }));
                     }
-                    let mut parts = Vec::new();
-                    if !turn.text.is_empty() {
-                        parts.push(json!({ "type": "input_text", "text": turn.text }));
+                    continue;
+                }
+                if turn.role == Role::Assistant {
+                    if !turn.text.is_empty() || turn.calls.is_empty() {
+                        input.push(json!({ "role": "assistant", "content": [{ "type": "output_text", "text": turn.text }] }));
                     }
-                    for picture in &turn.pictures {
-                        parts.push(json!({ "type": "input_image", "image_url": data_url(picture) }));
+                    for call in &turn.calls {
+                        // What the provider sent goes back as it came, with
+                        // the reasoning that led to the call.
+                        let sent = call.echo.as_deref().and_then(|echo| serde_json::from_str::<Vec<Value>>(echo).ok());
+                        match sent {
+                            Some(items) => input.extend(items),
+                            None => input.push(json!({
+                                "type": "function_call",
+                                "call_id": call.id,
+                                "name": call.name,
+                                "arguments": call.arguments,
+                            })),
+                        }
                     }
-                    json!({ "role": "user", "content": parts })
-                })
-                .collect();
+                    continue;
+                }
+                let mut parts = Vec::new();
+                if !turn.text.is_empty() {
+                    parts.push(json!({ "type": "input_text", "text": turn.text }));
+                }
+                for picture in &turn.pictures {
+                    parts.push(json!({ "type": "input_image", "image_url": data_url(picture) }));
+                }
+                input.push(json!({ "role": "user", "content": parts }));
+            }
             let mut body = json!({ "model": chat.model, "stream": true, "input": input });
+            if !chat.tools.is_empty() {
+                let tools: Vec<Value> = chat
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "type": "function",
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.schema,
+                        })
+                    })
+                    .collect();
+                body["tools"] = json!(tools);
+            }
             if !chat.system.is_empty() {
                 body["instructions"] = json!(chat.system);
             }
@@ -137,15 +248,36 @@ pub fn build(api: Api, base_url: &str, key: &str, chat: &ChatRequest) -> HttpReq
                 .turns
                 .iter()
                 .map(|turn| {
+                    if !turn.results.is_empty() {
+                        let results: Vec<Value> = turn
+                            .results
+                            .iter()
+                            .map(|result| json!({ "type": "tool_result", "tool_use_id": result.id, "content": result.text }))
+                            .collect();
+                        return json!({ "role": "user", "content": results });
+                    }
                     let mut parts = Vec::new();
+                    // Signed thinking comes first, exactly as it was received.
+                    for call in &turn.calls {
+                        let sent = call.echo.as_deref().and_then(|echo| serde_json::from_str::<Vec<Value>>(echo).ok());
+                        parts.extend(sent.into_iter().flatten());
+                    }
                     for picture in &turn.pictures {
                         parts.push(json!({
                             "type": "image",
                             "source": { "type": "base64", "media_type": picture.mime, "data": picture.base64 },
                         }));
                     }
-                    if !turn.text.is_empty() || parts.is_empty() {
+                    if !turn.text.is_empty() || (parts.is_empty() && turn.calls.is_empty()) {
                         parts.push(json!({ "type": "text", "text": turn.text }));
+                    }
+                    for call in &turn.calls {
+                        parts.push(json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            "input": arguments(&call.arguments),
+                        }));
                     }
                     let role = if turn.role == Role::User { "user" } else { "assistant" };
                     json!({ "role": role, "content": parts })
@@ -168,6 +300,14 @@ pub fn build(api: Api, base_url: &str, key: &str, chat: &ChatRequest) -> HttpReq
             if thinking > 0 {
                 body["thinking"] = json!({ "type": "enabled", "budget_tokens": thinking });
             }
+            if !chat.tools.is_empty() {
+                let tools: Vec<Value> = chat
+                    .tools
+                    .iter()
+                    .map(|tool| json!({ "name": tool.name, "description": tool.description, "input_schema": tool.schema }))
+                    .collect();
+                body["tools"] = json!(tools);
+            }
             ("/messages".into(), body)
         }
         Api::Gemini => {
@@ -176,20 +316,47 @@ pub fn build(api: Api, base_url: &str, key: &str, chat: &ChatRequest) -> HttpReq
                 .turns
                 .iter()
                 .map(|turn| {
+                    if !turn.results.is_empty() {
+                        let results: Vec<Value> = turn
+                            .results
+                            .iter()
+                            .map(|result| {
+                                json!({ "functionResponse": { "name": result.name, "response": { "result": result.text } } })
+                            })
+                            .collect();
+                        return json!({ "role": "user", "parts": results });
+                    }
                     let mut parts = Vec::new();
                     for picture in &turn.pictures {
                         parts.push(json!({
                             "inlineData": { "mimeType": picture.mime, "data": picture.base64 },
                         }));
                     }
-                    if !turn.text.is_empty() || parts.is_empty() {
+                    if !turn.text.is_empty() || (parts.is_empty() && turn.calls.is_empty()) {
                         parts.push(json!({ "text": turn.text }));
+                    }
+                    for call in &turn.calls {
+                        let mut part = json!({ "functionCall": { "name": call.name, "args": arguments(&call.arguments) } });
+                        if let Some(signature) = &call.echo {
+                            part["thoughtSignature"] = json!(signature);
+                        }
+                        parts.push(part);
                     }
                     let role = if turn.role == Role::User { "user" } else { "model" };
                     json!({ "role": role, "parts": parts })
                 })
                 .collect();
             let mut body = json!({ "contents": contents });
+            if !chat.tools.is_empty() {
+                let tools: Vec<Value> = chat
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({ "name": tool.name, "description": tool.description, "parametersJsonSchema": tool.schema })
+                    })
+                    .collect();
+                body["tools"] = json!([{ "functionDeclarations": tools }]);
+            }
             if !chat.system.is_empty() {
                 body["systemInstruction"] = json!({ "parts": [{ "text": chat.system }] });
             }
@@ -231,6 +398,8 @@ pub enum Event {
     Text(String),
     /// The model's thinking, where the provider shares it.
     Reasoning(String),
+    /// The model asks for a tool. Complete when it is reported.
+    Call(ToolCall),
     /// The reply is complete.
     Done,
     Error(String),
@@ -243,11 +412,36 @@ pub struct Decoder {
     buffer: Vec<u8>,
     data: String,
     finished: bool,
+    /// Tool calls that arrive in pieces, by their position in the reply.
+    calls: Vec<ToolCall>,
+    /// What the provider wants back with the next call.
+    echo: Vec<Value>,
+    /// The Anthropic content block being received, if it is one to keep.
+    block: Option<Value>,
 }
 
 impl Decoder {
     pub fn new(api: Api) -> Self {
-        Self { api, buffer: Vec::new(), data: String::new(), finished: false }
+        Self {
+            api,
+            buffer: Vec::new(),
+            data: String::new(),
+            finished: false,
+            calls: Vec::new(),
+            echo: Vec::new(),
+            block: None,
+        }
+    }
+
+    /// Report the calls assembled so far.
+    fn flush_calls(&mut self, events: &mut Vec<Event>) {
+        for call in self.calls.drain(..).filter(|call| !call.name.is_empty()) {
+            events.push(Event::Call(call));
+        }
+    }
+
+    fn take_echo(&mut self) -> Option<String> {
+        (!self.echo.is_empty()).then(|| Value::Array(std::mem::take(&mut self.echo)).to_string())
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
@@ -271,6 +465,7 @@ impl Decoder {
         self.dispatch(&mut events);
         if !self.finished {
             self.finished = true;
+            self.flush_calls(&mut events);
             events.push(Event::Done);
         }
         events
@@ -298,6 +493,7 @@ impl Decoder {
         }
         if data.trim() == "[DONE]" {
             self.finished = true;
+            self.flush_calls(events);
             events.push(Event::Done);
             return;
         }
@@ -317,11 +513,46 @@ impl Decoder {
                 if let Some(content) = text(&delta["content"]) {
                     events.push(Event::Text(content));
                 }
+                for piece in delta["tool_calls"].as_array().into_iter().flatten() {
+                    let index = piece["index"].as_u64().unwrap_or(0) as usize;
+                    if self.calls.len() <= index {
+                        self.calls.resize_with(index + 1, ToolCall::default);
+                    }
+                    let call = &mut self.calls[index];
+                    if let Some(id) = text(&piece["id"]) {
+                        call.id = id;
+                    }
+                    if let Some(name) = text(&piece["function"]["name"]) {
+                        call.name.push_str(&name);
+                    }
+                    if let Some(more) = piece["function"]["arguments"].as_str() {
+                        call.arguments.push_str(more);
+                    }
+                }
+                if !value["choices"][0]["finish_reason"].is_null() {
+                    self.flush_calls(events);
+                }
             }
             Api::Responses => match value["type"].as_str().unwrap_or_default() {
                 "response.output_text.delta" => events.extend(text(&value["delta"]).map(Event::Text)),
                 "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                     events.extend(text(&value["delta"]).map(Event::Reasoning));
+                }
+                "response.output_item.done" => {
+                    let item = &value["item"];
+                    match item["type"].as_str().unwrap_or_default() {
+                        "reasoning" => self.echo.push(item.clone()),
+                        "function_call" => {
+                            self.echo.push(item.clone());
+                            events.push(Event::Call(ToolCall {
+                                id: item["call_id"].as_str().unwrap_or_default().to_string(),
+                                name: item["name"].as_str().unwrap_or_default().to_string(),
+                                arguments: item["arguments"].as_str().unwrap_or("{}").to_string(),
+                                echo: self.take_echo(),
+                            }));
+                        }
+                        _ => {}
+                    }
                 }
                 "response.completed" | "response.incomplete" => {
                     self.finished = true;
@@ -330,11 +561,44 @@ impl Decoder {
                 _ => {}
             },
             Api::Anthropic => match value["type"].as_str().unwrap_or_default() {
+                "content_block_start" => {
+                    let block = &value["content_block"];
+                    self.block = match block["type"].as_str().unwrap_or_default() {
+                        "tool_use" => Some(json!({ "type": "tool_use", "id": block["id"], "name": block["name"], "json": "" })),
+                        "thinking" => Some(json!({ "type": "thinking", "thinking": "", "signature": "" })),
+                        // Thinking the provider hides still has to be handed back.
+                        "redacted_thinking" => {
+                            self.echo.push(block.clone());
+                            None
+                        }
+                        _ => None,
+                    };
+                }
                 "content_block_delta" => {
                     let delta = &value["delta"];
                     events.extend(text(&delta["text"]).map(Event::Text));
                     events.extend(text(&delta["thinking"]).map(Event::Reasoning));
+                    if let Some(block) = &mut self.block {
+                        for (from, to) in [("partial_json", "json"), ("thinking", "thinking"), ("signature", "signature")] {
+                            if let (Some(more), Some(so_far)) = (delta[from].as_str(), block[to].as_str()) {
+                                block[to] = json!(format!("{so_far}{more}"));
+                            }
+                        }
+                    }
                 }
+                "content_block_stop" => match self.block.take() {
+                    Some(block) if block["type"] == "tool_use" => {
+                        let written = block["json"].as_str().unwrap_or_default();
+                        events.push(Event::Call(ToolCall {
+                            id: block["id"].as_str().unwrap_or_default().to_string(),
+                            name: block["name"].as_str().unwrap_or_default().to_string(),
+                            arguments: if written.is_empty() { "{}".into() } else { written.to_string() },
+                            echo: self.take_echo(),
+                        }));
+                    }
+                    Some(block) => self.echo.push(block),
+                    None => {}
+                },
                 "message_stop" => {
                     self.finished = true;
                     events.push(Event::Done);
@@ -347,6 +611,16 @@ impl Decoder {
                     if let Some(piece) = text(&part["text"]) {
                         let thought = part["thought"] == true;
                         events.push(if thought { Event::Reasoning(piece) } else { Event::Text(piece) });
+                    }
+                    if part["functionCall"].is_object() {
+                        // Gemini gives calls no id; number them.
+                        self.calls.push(ToolCall::default());
+                        events.push(Event::Call(ToolCall {
+                            id: format!("call_{}", self.calls.len()),
+                            name: part["functionCall"]["name"].as_str().unwrap_or_default().to_string(),
+                            arguments: part["functionCall"]["args"].to_string(),
+                            echo: part["thoughtSignature"].as_str().map(str::to_string),
+                        }));
                     }
                 }
             }
@@ -454,7 +728,7 @@ mod tests {
     use super::*;
 
     fn chat<'a>(turns: &'a [Turn]) -> ChatRequest<'a> {
-        ChatRequest { model: "m", system: "be brief", turns, reasoning: None, temperature: None, info: None }
+        ChatRequest { model: "m", system: "be brief", turns, reasoning: None, temperature: None, info: None, tools: &[] }
     }
 
     fn picture() -> Picture {
@@ -689,5 +963,119 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         assert_eq!(describe_failure(502, ""), "供应商那边出错了（HTTP 502）");
         assert!(describe_failure(404, "<html>not found</html>").starts_with("地址或模型名不对（HTTP 404）："));
+    }
+
+    fn tool_turns() -> Vec<Turn> {
+        let call = ToolCall { id: "c1".into(), name: "web__fetch".into(), arguments: "{\"url\":\"https://x.test\"}".into(), echo: None };
+        let result = ToolResult { id: "c1".into(), name: "web__fetch".into(), text: "page".into() };
+        vec![
+            Turn::user("read it"),
+            Turn { calls: vec![call], ..Turn::assistant("") },
+            Turn { results: vec![result], ..Turn::user("") },
+        ]
+    }
+
+    fn tool() -> Tool {
+        Tool { name: "web__fetch".into(), description: "Fetch a page".into(), schema: json!({ "type": "object" }) }
+    }
+
+    #[test]
+    fn tools_and_their_results_go_out_in_each_dialect() {
+        let (turns, tools) = (tool_turns(), [tool()]);
+        let request = ChatRequest { tools: &tools, system: "", ..chat(&turns) };
+
+        let http = build(Api::ChatCompletions, "https://x.test", "k", &request);
+        assert_eq!(http.body["tools"][0]["function"]["name"], "web__fetch");
+        assert_eq!(http.body["messages"][1]["tool_calls"][0]["function"]["arguments"], "{\"url\":\"https://x.test\"}");
+        assert_eq!(http.body["messages"][2], json!({ "role": "tool", "tool_call_id": "c1", "content": "page" }));
+
+        let http = build(Api::Responses, "https://x.test", "k", &request);
+        assert_eq!(http.body["tools"][0], json!({ "type": "function", "name": "web__fetch", "description": "Fetch a page", "parameters": { "type": "object" } }));
+        assert_eq!(http.body["input"][1]["type"], "function_call");
+        assert_eq!(http.body["input"][2], json!({ "type": "function_call_output", "call_id": "c1", "output": "page" }));
+
+        let http = build(Api::Anthropic, "https://x.test", "k", &request);
+        assert_eq!(http.body["tools"][0]["input_schema"], json!({ "type": "object" }));
+        assert_eq!(http.body["messages"][1]["content"], json!([{ "type": "tool_use", "id": "c1", "name": "web__fetch", "input": { "url": "https://x.test" } }]));
+        assert_eq!(http.body["messages"][2]["content"][0], json!({ "type": "tool_result", "tool_use_id": "c1", "content": "page" }));
+
+        let http = build(Api::Gemini, "https://x.test", "k", &request);
+        assert_eq!(http.body["tools"][0]["functionDeclarations"][0]["name"], "web__fetch");
+        assert_eq!(http.body["contents"][1]["parts"][0]["functionCall"]["args"]["url"], "https://x.test");
+        assert_eq!(http.body["contents"][2]["parts"][0]["functionResponse"]["response"]["result"], "page");
+    }
+
+    #[test]
+    fn what_the_provider_wants_back_is_sent_back() {
+        let mut turns = tool_turns();
+        turns[1].calls[0].echo = Some("[{\"type\":\"reasoning\",\"id\":\"rs_1\"},{\"type\":\"function_call\",\"call_id\":\"c1\"}]".into());
+        let http = build(Api::Responses, "https://x.test", "k", &chat(&turns));
+        assert_eq!(http.body["input"][1], json!({ "type": "reasoning", "id": "rs_1" }));
+        assert_eq!(http.body["input"][2]["call_id"], "c1");
+
+        turns[1].calls[0].echo = Some("[{\"type\":\"thinking\",\"thinking\":\"hm\",\"signature\":\"sig\"}]".into());
+        let http = build(Api::Anthropic, "https://x.test", "k", &chat(&turns));
+        assert_eq!(http.body["messages"][1]["content"][0]["signature"], "sig");
+        assert_eq!(http.body["messages"][1]["content"][1]["type"], "tool_use");
+
+        turns[1].calls[0].echo = Some("sig".into());
+        let http = build(Api::Gemini, "https://x.test", "k", &chat(&turns));
+        assert_eq!(http.body["contents"][1]["parts"][0]["thoughtSignature"], "sig");
+    }
+
+    fn calls(api: Api, stream: &[u8]) -> Vec<Event> {
+        let mut decoder = Decoder::new(api);
+        let mut events = decoder.feed(stream);
+        events.extend(decoder.finish());
+        events
+    }
+
+    #[test]
+    fn tool_calls_are_assembled_from_the_stream() {
+        let events = calls(
+            Api::ChatCompletions,
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"web__fetch\",\"arguments\":\"{\\\"url\\\":\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a\\\"}\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let expected = ToolCall { id: "c1".into(), name: "web__fetch".into(), arguments: "{\"url\":\"a\"}".into(), echo: None };
+        assert_eq!(events, [Event::Call(expected), Event::Done]);
+
+        let events = calls(
+            Api::Responses,
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n\
+data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f\",\"arguments\":\"{}\"}}\n\n\
+data: {\"type\":\"response.completed\"}\n\n",
+        );
+        let Event::Call(call) = &events[0] else { panic!("{events:?}") };
+        assert_eq!((call.id.as_str(), call.name.as_str(), call.arguments.as_str()), ("c1", "f", "{}"));
+        // Key order depends on how serde_json is built; compare as values.
+        let echo: Value = serde_json::from_str(call.echo.as_deref().unwrap()).unwrap();
+        assert_eq!(echo[0], json!({ "type": "reasoning", "id": "rs_1" }));
+        assert_eq!(echo[1]["type"], "function_call");
+
+        let events = calls(
+            Api::Anthropic,
+            b"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hm\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n\
+data: {\"type\":\"content_block_stop\"}\n\n\
+data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"1}\"}}\n\n\
+data: {\"type\":\"content_block_stop\"}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        assert_eq!(events[0], Event::Reasoning("hm".into()));
+        let Event::Call(call) = &events[1] else { panic!("{events:?}") };
+        assert_eq!((call.id.as_str(), call.arguments.as_str()), ("t1", "{\"a\":1}"));
+        let echo: Value = serde_json::from_str(call.echo.as_deref().unwrap()).unwrap();
+        assert_eq!(echo, json!([{ "type": "thinking", "thinking": "hm", "signature": "sig" }]));
+
+        let events = calls(
+            Api::Gemini,
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"f\",\"args\":{\"a\":1}},\"thoughtSignature\":\"sig\"}]}}]}\n\n",
+        );
+        let expected = ToolCall { id: "call_1".into(), name: "f".into(), arguments: "{\"a\":1}".into(), echo: Some("sig".into()) };
+        assert_eq!(events, [Event::Call(expected), Event::Done]);
     }
 }

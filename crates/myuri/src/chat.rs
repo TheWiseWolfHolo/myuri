@@ -87,6 +87,7 @@ impl Route {
         reasoning: Option<Reasoning>,
         temperature: Option<f32>,
         info: Option<&ModelInfo>,
+        tools: &[llm::Tool],
         on_event: impl FnMut(Event) + Send + 'static,
     ) -> Abort {
         // A level the model lacks becomes the nearest one it has.
@@ -102,6 +103,7 @@ impl Route {
                 reasoning,
                 temperature,
                 info,
+                tools,
             };
             let mut request = llm::build(self.api, &self.base_url, key, &chat);
             request.headers.extend(self.headers.iter().cloned());

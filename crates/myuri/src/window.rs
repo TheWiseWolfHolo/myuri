@@ -29,8 +29,10 @@ use crate::images;
 use crate::secrets;
 use crate::speech;
 use myuri_core::gesture::Pos;
-use myuri_core::history::{self, Conversation, Entry};
-use myuri_core::llm::{Event, Picture, Role, Turn};
+use myuri_core::history::{self, Conversation, Entry, SavedCall};
+use myuri_core::llm::{Event, Picture, Role, ToolCall, ToolResult, Turn};
+
+use crate::mcp::Kit;
 
 use crate::applog::info;
 use crate::capture::{Content, ImageFormat};
@@ -77,6 +79,39 @@ struct Shot {
     thumb: Option<Arc<gpui_kit::Image>>,
 }
 
+/// Where a tool call stands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallStatus {
+    /// Just asked for by the model.
+    Pending,
+    /// The user has to allow it first.
+    Waiting,
+    Running,
+    Done,
+    Failed,
+    Denied,
+}
+
+struct CallState {
+    call: ToolCall,
+    status: CallStatus,
+    /// What goes back to the model.
+    result: String,
+    /// The arguments and the result are shown.
+    open: bool,
+}
+
+impl CallState {
+    fn settled(&self) -> bool {
+        matches!(self.status, CallStatus::Done | CallStatus::Failed | CallStatus::Denied)
+    }
+}
+
+/// How many times in a row the model may come back for more tools.
+const MAX_ROUNDS: usize = 16;
+/// Longer tool results are cut before they go to the model.
+const MAX_RESULT: usize = 60_000;
+
 struct Message {
     role: Role,
     text: String,
@@ -95,6 +130,19 @@ struct Message {
     thinking_since: Option<Instant>,
     thought_for: Option<Duration>,
     thoughts_open: bool,
+    /// Tools the assistant asked for in this message.
+    calls: Vec<CallState>,
+}
+
+impl Message {
+    /// A reply that has not received anything yet.
+    fn blank(&self) -> bool {
+        self.role == Role::Assistant
+            && self.text.is_empty()
+            && self.shots.is_empty()
+            && self.thoughts.is_empty()
+            && self.calls.is_empty()
+    }
 }
 
 pub struct ChatView {
@@ -150,6 +198,13 @@ pub struct ChatView {
     /// Under which id and creation time the conversation is saved.
     conversation: String,
     created: u64,
+    /// The assistant's tools and skills, gathered at the first request.
+    kit: Option<Arc<Kit>>,
+    kit_loading: bool,
+    /// Servers whose tools need no further asking in this conversation.
+    trusted: std::collections::HashSet<String>,
+    /// Requests made in a row because the model asked for tools.
+    rounds: usize,
 }
 
 pub fn open(opening: Opening, cx: &mut App) {
@@ -278,6 +333,10 @@ impl ChatView {
                     .unwrap_or_default(),
             ),
             created: crate::historyview::now(),
+            kit: None,
+            kit_loading: false,
+            trusted: Default::default(),
+            rounds: 0,
             _subscriptions: subscriptions,
         };
         if let Some(conversation) = opening.resume {
@@ -345,6 +404,7 @@ impl ChatView {
             thinking_since: None,
             thought_for: None,
             thoughts_open: false,
+            calls: Vec::new(),
         });
     }
 
@@ -361,8 +421,22 @@ impl ChatView {
                 let bytes = base64::engine::general_purpose::STANDARD.decode(&picture.base64).ok()?;
                 gpui_image(&bytes)
             });
-            self.push(Turn { role, text: entry.text, pictures }, thumb, cx);
+            let turn = match role {
+                Role::User => Turn { pictures, ..Turn::user(entry.text) },
+                Role::Assistant => Turn::assistant(entry.text),
+            };
+            self.push(turn, thumb, cx);
             if let Some(message) = self.messages.last_mut() {
+                message.calls = entry
+                    .calls
+                    .into_iter()
+                    .map(|saved| CallState {
+                        status: if saved.failed { CallStatus::Failed } else { CallStatus::Done },
+                        call: ToolCall { id: saved.id, name: saved.name, arguments: saved.arguments, echo: saved.echo },
+                        result: saved.result,
+                        open: false,
+                    })
+                    .collect();
                 message.thoughts = entry.thoughts;
                 message.shots = entry
                     .shots
@@ -399,6 +473,18 @@ impl ChatView {
                     thoughts: m.thoughts.clone(),
                     pictures: m.pictures.iter().map(|p| (p.mime.clone(), p.base64.clone())).collect(),
                     shots: m.shots.iter().map(|shot| shot.path.display().to_string()).collect(),
+                    calls: m
+                        .calls
+                        .iter()
+                        .map(|state| SavedCall {
+                            id: state.call.id.clone(),
+                            name: state.call.name.clone(),
+                            arguments: state.call.arguments.clone(),
+                            echo: state.call.echo.clone(),
+                            result: state.result.clone(),
+                            failed: state.status != CallStatus::Done,
+                        })
+                        .collect(),
                 })
                 .collect(),
         };
@@ -429,6 +515,7 @@ impl ChatView {
             None if text.is_empty() => return,
             None => self.push(Turn::user(text), None, cx),
         }
+        self.rounds = 0;
         self.request(cx);
     }
 
@@ -443,7 +530,12 @@ impl ChatView {
 
     /// A chat or image request is in flight.
     fn busy(&self) -> bool {
-        self.abort.is_some() || self.generating
+        self.abort.is_some() || self.generating || self.kit_loading || self.tools_open()
+    }
+
+    /// The newest reply has tool calls that are not finished.
+    fn tools_open(&self) -> bool {
+        self.messages.last().is_some_and(|m| m.calls.iter().any(|state| !state.settled()))
     }
 
     /// Ask for a reply to the conversation so far.
@@ -457,20 +549,65 @@ impl ChatView {
             self.error = Some(problem.clone());
             return cx.notify();
         }
-        let turns: Vec<Turn> = self
-            .messages
-            .iter()
-            .map(|m| Turn { role: m.role, text: m.text.clone(), pictures: m.pictures.clone() })
-            .collect();
         // The reply fills in as it streams.
-        self.push(Turn::assistant(""), None, cx);
+        if !self.messages.last().is_some_and(Message::blank) {
+            self.push(Turn::assistant(""), None, cx);
+        }
         self.generation += 1;
         let generation = self.generation;
+        // Servers start the first time they are needed, which can take a
+        // moment; the request goes out once they are up.
+        let equipped = !self.assistant.tools.is_empty() || !self.assistant.skills.is_empty();
+        if equipped && self.kit.is_none() {
+            self.kit_loading = true;
+            let (assistant, dir) = (self.assistant.clone(), crate::config_dir());
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let _ = tx.send_blocking(Kit::gather(&dir, &assistant));
+            });
+            cx.spawn(async move |this, cx| {
+                let Ok(kit) = rx.recv().await else { return };
+                let _ = this.update(cx, |this, cx| {
+                    this.kit_loading = false;
+                    let problems = kit.problems.join("；");
+                    this.kit = Some(Arc::new(kit));
+                    if this.generation == generation {
+                        this.request(cx);
+                        if !problems.is_empty() {
+                            this.error = Some(problems);
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+            return cx.notify();
+        }
+        let answered = &self.messages[..self.messages.len() - 1];
+        let mut turns: Vec<Turn> = Vec::new();
+        for m in answered {
+            let calls: Vec<ToolCall> = m.calls.iter().map(|state| state.call.clone()).collect();
+            let results: Vec<ToolResult> = m
+                .calls
+                .iter()
+                .map(|state| ToolResult {
+                    id: state.call.id.clone(),
+                    name: state.call.name.clone(),
+                    text: state.result.clone(),
+                })
+                .collect();
+            turns.push(Turn { calls, ..Turn { role: m.role, text: m.text.clone(), pictures: m.pictures.clone(), calls: Vec::new(), results: Vec::new() } });
+            if !results.is_empty() {
+                turns.push(Turn { results, ..Turn::user("") });
+            }
+        }
         let (tx, rx) = async_channel::unbounded();
         let Ok(route) = &self.route else { return };
         let info = self.catalog.lookup(&route.model);
         let (reasoning, temperature) = (self.reasoning, self.assistant.temperature);
-        self.abort = Some(route.send(&self.system, &turns, reasoning, temperature, info, move |event| {
+        let kit = self.kit.clone().unwrap_or_default();
+        let system = format!("{}{}", self.system, kit.prompt);
+        self.abort = Some(route.send(&system, &turns, reasoning, temperature, info, &kit.tools, move |event| {
             let _ = tx.try_send(event);
         }));
         cx.spawn(async move |this, cx| {
@@ -512,6 +649,11 @@ impl ChatView {
                         reply.thoughts.push_str(&piece);
                     }
                 }
+                Event::Call(call) => {
+                    if let Some(reply) = self.messages.last_mut() {
+                        reply.calls.push(CallState { call, status: CallStatus::Pending, result: String::new(), open: false });
+                    }
+                }
                 Event::Done => {
                     self.abort = None;
                     if let Some(reply) = self.messages.last_mut() {
@@ -521,6 +663,8 @@ impl ChatView {
                     }
                     self.drop_empty_reply();
                     self.remember();
+                    // The model asked for tools: run them, then ask again.
+                    self.advance(cx);
                 }
                 Event::Error(reason) => {
                     self.abort = None;
@@ -613,11 +757,111 @@ impl ChatView {
 
     /// A reply with nothing in it would be sent back as an empty turn.
     fn drop_empty_reply(&mut self) {
-        if self.messages.last().is_some_and(|m| {
-            m.role == Role::Assistant && m.text.is_empty() && m.shots.is_empty() && m.thoughts.is_empty()
-        }) {
+        if self.messages.last().is_some_and(Message::blank) {
             self.messages.pop();
         }
+    }
+
+    /// Move the newest reply's tool calls along: ask the user where the
+    /// server wants that, start the rest, and once every call has an answer
+    /// send them all back to the model.
+    fn advance(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.messages.len().checked_sub(1) else { return };
+        if self.messages[index].calls.is_empty() {
+            return;
+        }
+        let kit = self.kit.clone().unwrap_or_default();
+        for n in 0..self.messages[index].calls.len() {
+            if self.messages[index].calls[n].status != CallStatus::Pending {
+                continue;
+            }
+            let name = self.messages[index].calls[n].call.name.clone();
+            let asks = kit.asks_first(&name)
+                && !kit.server(&name).is_some_and(|server| self.trusted.contains(server));
+            if asks {
+                self.messages[index].calls[n].status = CallStatus::Waiting;
+            } else {
+                self.run_call(index, n, cx);
+            }
+        }
+        if self.messages[index].calls.iter().all(CallState::settled) && self.abort.is_none() {
+            self.remember();
+            self.rounds += 1;
+            if self.rounds > MAX_ROUNDS {
+                self.error = Some(format!("连着调用了 {MAX_ROUNDS} 轮工具，先停在这里"));
+            } else {
+                self.request(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Carry out one tool call off the UI thread.
+    fn run_call(&mut self, index: usize, n: usize, cx: &mut Context<Self>) {
+        let Some(kit) = self.kit.clone() else {
+            let state = &mut self.messages[index].calls[n];
+            state.status = CallStatus::Failed;
+            state.result = "Error: the tool is not available.".into();
+            return;
+        };
+        let state = &mut self.messages[index].calls[n];
+        state.status = CallStatus::Running;
+        let (name, arguments) = (state.call.name.clone(), state.call.arguments.clone());
+        let generation = self.generation;
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(kit.call(&name, &arguments));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(outcome) = rx.recv().await else { return };
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                let Some(state) = this.messages.get_mut(index).and_then(|m| m.calls.get_mut(n)) else { return };
+                match outcome {
+                    Ok(text) => {
+                        state.status = CallStatus::Done;
+                        state.result = match text.char_indices().nth(MAX_RESULT) {
+                            Some((cut, _)) => format!("{}\n…(truncated)", &text[..cut]),
+                            None => text,
+                        };
+                    }
+                    Err(reason) => {
+                        state.status = CallStatus::Failed;
+                        state.result = format!("Error: {reason}");
+                    }
+                }
+                this.advance(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The user answered the question whether a tool may run. `always`
+    /// extends a yes to the rest of the conversation for that server.
+    fn decide(&mut self, index: usize, n: usize, allow: bool, always: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.messages.get_mut(index).and_then(|m| m.calls.get_mut(n)) else { return };
+        if state.status != CallStatus::Waiting {
+            return;
+        }
+        if !allow {
+            state.status = CallStatus::Denied;
+            state.result = "The user declined this tool call.".into();
+        } else if always {
+            let name = state.call.name.clone();
+            let server = self.kit.as_ref().and_then(|kit| kit.server(&name).map(str::to_string));
+            self.trusted.extend(server);
+            // Others waiting on the same server go ahead too.
+            for state in &mut self.messages[index].calls {
+                if state.status == CallStatus::Waiting {
+                    state.status = CallStatus::Pending;
+                }
+            }
+        } else {
+            self.run_call(index, n, cx);
+        }
+        self.advance(cx);
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -625,8 +869,16 @@ impl ChatView {
             abort.abort();
         }
         self.generating = false;
+        self.kit_loading = false;
         // Whatever the stopped request still delivers belongs to nobody.
         self.generation += 1;
+        // Every call needs an answer before the conversation can go on.
+        for state in self.messages.last_mut().into_iter().flat_map(|m| &mut m.calls) {
+            if !state.settled() {
+                state.status = CallStatus::Denied;
+                state.result = "Cancelled by the user.".into();
+            }
+        }
         self.drop_empty_reply();
         // What arrived before the stop is kept.
         self.remember();
@@ -637,10 +889,12 @@ impl ChatView {
         if self.abort.is_some() {
             return;
         }
-        if self.messages.last().is_some_and(|m| m.role == Role::Assistant) {
+        // Tool rounds make several replies to one question; redo them all.
+        while self.messages.last().is_some_and(|m| m.role == Role::Assistant) {
             self.messages.pop();
         }
         if !self.messages.is_empty() {
+            self.rounds = 0;
             self.request(cx);
         }
     }
@@ -1145,7 +1399,118 @@ impl ChatView {
                     .child(text)
             }))
         });
-        div().w_full().flex().flex_col().gap(px(4.0)).children(thoughts).child(body).children(actions)
+        let kit = self.kit.clone();
+        let calls = message.calls.iter().enumerate().map(|(n, state)| {
+            let label = match &kit {
+                Some(kit) => kit.label(&state.call.name),
+                None => state.call.name.replace("__", " · "),
+            };
+            let (status, color) = match state.status {
+                CallStatus::Pending | CallStatus::Waiting => ("等你确认", palette.accent),
+                CallStatus::Running => ("运行中", palette.muted),
+                CallStatus::Done => ("完成", palette.faint),
+                CallStatus::Failed => ("失败", palette.accent),
+                CallStatus::Denied => ("没有运行", palette.faint),
+            };
+            let open = state.open || state.status == CallStatus::Waiting;
+            let header = div()
+                .id(("call", index * 131 + n))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .cursor_pointer()
+                .child(svg().path("icons/wrench.svg").size(px(13.0)).flex_none().text_color(palette.muted))
+                .child(div().min_w(px(0.0)).truncate().text_color(palette.ink).child(label))
+                .child(div().flex_none().text_color(color).child(status))
+                .child(div().flex_1())
+                .child(
+                    svg()
+                        .path(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" })
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(palette.faint),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(state) = this.messages.get_mut(index).and_then(|m| m.calls.get_mut(n)) {
+                        state.open = !state.open;
+                        cx.notify();
+                    }
+                }));
+            let block = |text: String| {
+                div()
+                    .w_full()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded(px(7.0))
+                    .bg(palette.surface)
+                    .font_family("Consolas")
+                    .text_size(px(11.5))
+                    .line_height(relative(1.5))
+                    .text_color(palette.muted)
+                    .child(text)
+            };
+            let written = serde_json::from_str::<serde_json::Value>(&state.call.arguments)
+                .ok()
+                .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                .unwrap_or_else(|| state.call.arguments.clone());
+            let shown: String = state.result.chars().take(1500).collect();
+            let more = state.result.chars().count() > 1500;
+            let choice = |id: usize, label: &'static str, primary: bool| {
+                div()
+                    .id(("decide", (index * 131 + n) * 3 + id))
+                    .h(px(26.0))
+                    .px(px(11.0))
+                    .rounded(px(7.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .when(primary, |button| button.bg(palette.accent).text_color(rgb(0xFFFFFF)))
+                    .when(!primary, |button| button.border_1().border_color(palette.hairline).text_color(palette.muted))
+                    .hover(|style| style.opacity(0.88))
+                    .child(label)
+            };
+            let asking = (state.status == CallStatus::Waiting).then(|| {
+                div()
+                    .flex()
+                    .gap(px(6.0))
+                    .child(choice(0, "允许", true).on_click(cx.listener(move |this, _, _, cx| this.decide(index, n, true, false, cx))))
+                    .child(
+                        choice(1, "这次对话都允许", false)
+                            .on_click(cx.listener(move |this, _, _, cx| this.decide(index, n, true, true, cx))),
+                    )
+                    .child(choice(2, "拒绝", false).on_click(cx.listener(move |this, _, _, cx| this.decide(index, n, false, false, cx))))
+            });
+            div()
+                .w_full()
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(palette.hairline)
+                .bg(palette.raised)
+                .font(theme::sans())
+                .text_size(px(12.5))
+                .line_height(relative(1.4))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(header)
+                .when(open, |card| {
+                    card.child(block(written))
+                        .when(!shown.is_empty(), |card| card.child(block(if more { format!("{shown}…") } else { shown })))
+                })
+                .children(asking)
+        });
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .children(thoughts)
+            .child(body)
+            .children(calls)
+            .children(actions)
     }
 
     fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

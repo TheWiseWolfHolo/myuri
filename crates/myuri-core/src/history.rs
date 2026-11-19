@@ -25,6 +25,24 @@ pub struct Entry {
     /// Files of pictures the assistant generated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shots: Vec<String>,
+    /// Tools the assistant called in this message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<SavedCall>,
+}
+
+/// A tool call and how it ended.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub echo: Option<String>,
+    /// What went back to the model.
+    #[serde(default)]
+    pub result: String,
+    #[serde(default)]
+    pub failed: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

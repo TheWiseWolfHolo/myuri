@@ -23,10 +23,9 @@ const VERSION: u32 = 1;
 const ROUNDS: u32 = 210_000;
 
 /// Folders that are part of a backup, besides the three settings files.
-const FOLDERS: &[&str] = &[config::PROMPTS_DIR, "icons", "skills"];
+const FOLDERS: &[&str] = &[config::PROMPTS_DIR, "icons", crate::mcp::SKILLS_DIR];
 /// Downloaded copies that come back by themselves.
 const CACHES: &[&str] = &["icons/lobehub", "icons/web"];
-const MCP_FILE: &str = "mcp.toml";
 
 #[derive(Serialize, Deserialize)]
 struct Sealed {
@@ -64,7 +63,7 @@ fn slashed(path: &Path) -> String {
 
 /// Everything in `dir` that belongs in a backup.
 pub fn collect(dir: &Path, with_history: bool) -> BTreeMap<String, Vec<u8>> {
-    let mut paths: Vec<PathBuf> = [config::SETTINGS_FILE, config::ASSISTANTS_FILE, config::PROVIDERS_FILE, MCP_FILE]
+    let mut paths: Vec<PathBuf> = [config::SETTINGS_FILE, config::ASSISTANTS_FILE, config::PROVIDERS_FILE, crate::mcp::MCP_FILE]
         .iter()
         .map(PathBuf::from)
         .collect();

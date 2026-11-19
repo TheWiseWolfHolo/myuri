@@ -227,6 +227,7 @@ impl Running {
     }
 
     fn shutdown(&self, cx: &mut App) {
+        crate::mcp::stop_all();
         self.hook.quit();
         self.capture.quit();
         self.tray.quit();

@@ -14,6 +14,9 @@ pub enum Field {
     /// An array of inline tables, one row per entry, e.g.
     /// `keys = [ { note = "a" }, { enabled = false } ]`. Empty removes the key.
     Table(Vec<Vec<(&'static str, Field)>>),
+    /// An inline table of text values, e.g. `env = { A = "1" }`. Empty
+    /// removes the key.
+    Map(Vec<(String, String)>),
     Absent,
 }
 
@@ -38,6 +41,14 @@ impl Field {
                 array.set_trailing("\n");
                 array.set_trailing_comma(true);
                 Some(value(array))
+            }
+            Self::Map(entries) if entries.is_empty() => None,
+            Self::Map(entries) => {
+                let mut table = toml_edit::InlineTable::new();
+                for (key, text) in entries {
+                    table.insert(key, text.as_str().into());
+                }
+                Some(value(table))
             }
             Self::Table(rows) if rows.is_empty() => None,
             Self::Table(rows) => {
@@ -335,5 +346,17 @@ mod tests {
         assert_eq!(parse_settings(&added).unwrap().hotkey.panel, "Ctrl+Alt+A");
         let removed = set_setting(&added, "hotkey", "panel", Field::Absent).unwrap();
         assert_eq!(parse_settings(&removed).unwrap().hotkey.panel, "Alt+Space");
+    }
+
+    #[test]
+    fn maps_write_as_inline_tables() {
+        let source = "[[server]]\nname = \"a\"\ncommand = \"x\"\n";
+        let env = Field::Map(vec![("HTTP_PROXY".into(), "http://127.0.0.1:1".into()), ("B C".into(), "2".into())]);
+        let changed = set_entry(source, "server", "name", "a", &[("env", env)]).unwrap();
+        let servers = crate::mcp::parse_servers(&changed).unwrap();
+        assert_eq!(servers[0].env["HTTP_PROXY"], "http://127.0.0.1:1");
+        assert_eq!(servers[0].env["B C"], "2");
+        let cleared = set_entry(&changed, "server", "name", "a", &[("env", Field::Map(Vec::new()))]).unwrap();
+        assert!(!cleared.contains("env"));
     }
 }

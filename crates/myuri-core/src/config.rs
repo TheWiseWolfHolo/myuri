@@ -788,6 +788,7 @@ pub fn ensure_defaults(dir: &Path) -> std::io::Result<()> {
         (SETTINGS_FILE, DEFAULT_SETTINGS),
         (ASSISTANTS_FILE, DEFAULT_ASSISTANTS),
         (PROVIDERS_FILE, DEFAULT_PROVIDERS),
+        (crate::mcp::MCP_FILE, crate::mcp::DEFAULT_MCP),
     ] {
         let path = dir.join(name);
         if !path.exists() {

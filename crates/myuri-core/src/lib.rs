@@ -13,5 +13,6 @@ pub mod hotkey;
 pub mod image;
 pub mod llm;
 pub mod matching;
+pub mod mcp;
 pub mod speech;
 pub mod uistate;

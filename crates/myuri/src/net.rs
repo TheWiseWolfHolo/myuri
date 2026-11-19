@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use windows::Win32::Networking::WinHttp::{
     URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ADDREQ_FLAG_ADD,
     WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_OPEN_REQUEST_FLAGS,
-    WINHTTP_OPTION_DECOMPRESSION, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_OPTION_DECOMPRESSION, WINHTTP_QUERY_CUSTOM, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, WINHTTP_QUERY_FLAG_NUMBER,
     WINHTTP_QUERY_STATUS_CODE, WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect,
     WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
     WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
@@ -166,6 +166,47 @@ pub fn post(url: &str, headers: &[(String, String)], body: &[u8]) -> Result<(u16
         exchange(w!("POST"), url, headers, body, &slot, &mut |_, bytes| reply.extend_from_slice(bytes));
     close(&slot);
     Ok((status?, reply))
+}
+
+/// Like [`post`], and also returns the response header `wanted` if the
+/// server sent it.
+pub fn post_for(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    wanted: &str,
+) -> Result<(u16, Vec<u8>, Option<String>), String> {
+    let slot = AtomicUsize::new(0);
+    let mut reply = Vec::new();
+    let status =
+        exchange(w!("POST"), url, headers, body, &slot, &mut |_, bytes| reply.extend_from_slice(bytes));
+    let found = status.as_ref().ok().and_then(|_| header(&slot, wanted));
+    close(&slot);
+    Ok((status?, reply, found))
+}
+
+/// A response header of the request whose handle is in `slot`.
+fn header(slot: &AtomicUsize, name: &str) -> Option<String> {
+    let handle = slot.load(Ordering::SeqCst);
+    if handle == 0 {
+        return None;
+    }
+    let name = wide(name);
+    let mut buffer = [0u16; 512];
+    let mut size = size_of_val(&buffer) as u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            handle as *mut c_void,
+            WINHTTP_QUERY_CUSTOM,
+            PCWSTR(name.as_ptr()),
+            Some(buffer.as_mut_ptr().cast()),
+            &mut size,
+            std::ptr::null_mut(),
+        )
+        .ok()?;
+    }
+    let length = (size as usize / 2).min(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..length]).trim().to_string()).filter(|value| !value.is_empty())
 }
 
 /// Store a document at `url`, replacing what is there. Blocks.

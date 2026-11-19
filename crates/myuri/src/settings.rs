@@ -42,6 +42,7 @@ enum Tab {
     General,
     History,
     Sync,
+    Tools,
 }
 
 impl Tab {
@@ -50,7 +51,7 @@ impl Tab {
             Self::Chat => Some(Purpose::Chat),
             Self::Images => Some(Purpose::Images),
             Self::Speech => Some(Purpose::Speech),
-            Self::Assistants | Self::General | Self::History | Self::Sync => None,
+            Self::Assistants | Self::General | Self::History | Self::Sync | Self::Tools => None,
         }
     }
 
@@ -63,6 +64,7 @@ impl Tab {
             Self::General => "general",
             Self::History => "history",
             Self::Sync => "sync",
+            Self::Tools => "tools",
         }
     }
 
@@ -75,13 +77,14 @@ impl Tab {
             "general" => Self::General,
             "history" => Self::History,
             "sync" => Self::Sync,
+            "tools" => Self::Tools,
             _ => return None,
         })
     }
 
     /// The page is a view of its own instead of a list and a form.
     fn own_page(self) -> bool {
-        matches!(self, Self::History | Self::Sync)
+        matches!(self, Self::History | Self::Sync | Self::Tools)
     }
 }
 
@@ -158,6 +161,13 @@ pub struct SettingsView {
     picker_default: bool,
     history: Entity<crate::historyview::HistoryView>,
     sync: Entity<crate::syncview::SyncView>,
+    tools_page: Entity<crate::toolsview::ToolsView>,
+    /// The open assistant's MCP servers and skills, as they will be saved.
+    tools: Vec<String>,
+    skills: Vec<String>,
+    /// What there is to choose from.
+    server_names: Vec<String>,
+    skill_names: Vec<String>,
     /// `[models] default`: what assistants without a model use.
     default_model: Entity<InputState>,
     prompt: Entity<TextareaState>,
@@ -293,9 +303,18 @@ impl SettingsView {
             cx.notify();
         });
         subscriptions.push(restored);
+        let tools_page = {
+            let dir = dir.clone();
+            cx.new(|cx| crate::toolsview::ToolsView::new(dir, theme::palette(dark), window, cx))
+        };
         let mut view = Self {
             history,
             sync,
+            tools_page,
+            tools: Vec::new(),
+            skills: Vec::new(),
+            server_names: Vec::new(),
+            skill_names: Vec::new(),
             catalog: std::sync::Arc::new(models::load(&dir)),
             dir,
             palette: theme::palette(dark),
@@ -417,6 +436,9 @@ impl SettingsView {
         self.picker = None;
         let Some(assistant) = self.assistants.get(self.assistant).cloned() else { return };
         let prompt = config::load_prompt(&self.dir, &assistant);
+        self.tools = assistant.tools.clone();
+        self.skills = assistant.skills.clone();
+        self.load_tool_names();
         self.name.update(cx, |input, cx| input.set_value(assistant.name.clone(), window, cx));
         self.icon.update(cx, |input, cx| input.set_value(assistant.icon.clone(), window, cx));
         let model = assistant.model.clone().unwrap_or_default();
@@ -529,6 +551,8 @@ impl SettingsView {
         let renamed = Assistant { name: name.clone(), ..assistant.clone() };
         let changes = [
             ("name", Field::Text(name.clone())),
+            ("tools", Field::List(self.tools.clone())),
+            ("skills", Field::List(self.skills.clone())),
             ("enabled", Field::Flag(self.enabled)),
             ("icon", Field::optional(&read(&self.icon))),
             ("model", Field::optional(&read(&self.model))),
@@ -989,8 +1013,21 @@ impl SettingsView {
         if tab == Tab::History {
             self.history.update(cx, |history, cx| history.refresh(cx));
         }
+        if tab == Tab::Tools {
+            self.tools_page.update(cx, |tools, cx| tools.refresh(window, cx));
+        }
+        if tab == Tab::Assistants {
+            self.load_tool_names();
+        }
         self.save_ui_state();
         cx.notify();
+    }
+
+    /// The servers and skills an assistant can be given.
+    fn load_tool_names(&mut self) {
+        let servers = myuri_core::mcp::load_servers(&self.dir).unwrap_or_default();
+        self.server_names = servers.into_iter().filter(|server| server.enabled).map(|server| server.name).collect();
+        self.skill_names = myuri_core::mcp::load_skills(&self.dir).into_iter().map(|skill| skill.name).collect();
     }
 
     /// Go to a page by its name, as other windows ask for it.
@@ -1007,6 +1044,7 @@ impl SettingsView {
             (Tab::Chat, "icons/message-circle.svg", "对话"),
             (Tab::Images, "icons/image.svg", "生图"),
             (Tab::Speech, "icons/audio-lines.svg", "语音"),
+            (Tab::Tools, "icons/wrench.svg", "工具"),
             (Tab::General, "icons/sliders-horizontal.svg", "通用"),
             (Tab::History, "icons/history.svg", "历史"),
             (Tab::Sync, "icons/cloud-upload.svg", "同步"),
@@ -1039,7 +1077,7 @@ impl SettingsView {
         let query = self.search.read(cx).value().trim().to_lowercase();
         let found = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
         let rows: Vec<AnyElement> = match self.tab {
-            Tab::General | Tab::History | Tab::Sync => return None,
+            Tab::General | Tab::History | Tab::Sync | Tab::Tools => return None,
             Tab::Assistants => self
                 .assistants
                 .iter()
@@ -1429,9 +1467,61 @@ impl SettingsView {
             field("模型", model_field, palette),
             field("思考强度", div().flex().flex_wrap().gap(px(6.0)).children(reasoning), palette),
             field("图标", boxed(Input::new(&self.icon).appearance(false), palette), palette),
+            field("工具", self.picks(false, cx), palette),
+            field("技能", self.picks(true, cx), palette),
             field("提示词", boxed(Textarea::new(&self.prompt).appearance(false), palette), palette),
             self.footer("save-assistant", cx.listener(|this, _, window, cx| this.save_assistant(window, cx))),
         ]
+    }
+
+    /// The MCP servers, or the skills, as chips that switch on and off.
+    fn picks(&self, skills: bool, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette;
+        let (names, chosen) = if skills { (&self.skill_names, &self.skills) } else { (&self.server_names, &self.tools) };
+        // What is written but no longer exists still shows, so it can be removed.
+        let gone = chosen.iter().filter(|name| !names.contains(name) && *name != "*");
+        let all: Vec<String> = names.iter().chain(gone).cloned().collect();
+        if all.is_empty() {
+            let hint = if skills { "技能文件夹里还没有技能，在「工具」页里打开它" } else { "还没有 MCP 服务，在「工具」页里添加" };
+            return div().text_size(px(12.5)).text_color(palette.faint).child(hint).into_any_element();
+        }
+        div()
+            .flex()
+            .flex_wrap()
+            .gap(px(6.0))
+            .children(all.into_iter().enumerate().map(|(index, name)| {
+                let on = chosen.contains(&name) || chosen.iter().any(|entry| entry == "*");
+                let label = name.clone();
+                div()
+                    .id((if skills { "skill-pick" } else { "tool-pick" }, index))
+                    .h(px(30.0))
+                    .px(px(12.0))
+                    .rounded(px(8.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .border_1()
+                    .text_size(px(12.5))
+                    .when(on, |chip| chip.bg(palette.accent_wash).border_color(palette.accent).text_color(palette.accent))
+                    .when(!on, |chip| chip.border_color(palette.hairline))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let every: Vec<String> = if skills { this.skill_names.clone() } else { this.server_names.clone() };
+                        let list = if skills { &mut this.skills } else { &mut this.tools };
+                        // "*" becomes the full list the moment one is taken out.
+                        if list.iter().any(|entry| entry == "*") {
+                            *list = every;
+                        }
+                        match list.iter().position(|entry| entry == &name) {
+                            Some(position) => {
+                                list.remove(position);
+                            }
+                            None => list.push(name.clone()),
+                        }
+                        cx.notify();
+                    }))
+            }))
+            .into_any_element()
     }
 
     fn provider_form(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1966,12 +2056,13 @@ impl Render for SettingsView {
             Tab::Assistants => self.assistant_form(cx),
             Tab::Chat | Tab::Images | Tab::Speech => self.provider_form(cx),
             Tab::General => self.general_form(cx),
-            Tab::History | Tab::Sync => Vec::new(),
+            Tab::History | Tab::Sync | Tab::Tools => Vec::new(),
         };
         // Pages that are views of their own fill everything right of the nav.
         let page = match self.tab {
             Tab::History => Some(div().flex_1().min_w(px(0.0)).h_full().child(self.history.clone())),
             Tab::Sync => Some(div().flex_1().min_w(px(0.0)).h_full().child(self.sync.clone())),
+            Tab::Tools => Some(div().flex_1().min_w(px(0.0)).h_full().child(self.tools_page.clone())),
             _ => None,
         };
         let title = div()
