@@ -2,7 +2,7 @@
 //! the panel lists). Unknown keys and out-of-range values are errors, so a
 //! typo is reported instead of silently ignored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -14,11 +14,16 @@ use crate::hotkey;
 pub const SETTINGS_FILE: &str = "config.toml";
 pub const ASSISTANTS_FILE: &str = "assistants.toml";
 pub const PROVIDERS_FILE: &str = "providers.toml";
+pub const IMAGE_PROVIDERS_FILE: &str = "image_providers.toml";
+pub const SPEECH_PROVIDERS_FILE: &str = "speech_providers.toml";
+pub const NS_CHAT: &str = "provider";
+pub const NS_IMAGE: &str = "image";
+pub const NS_SPEECH: &str = "speech";
 /// Folder of system prompts, one Markdown file per assistant.
 pub const PROMPTS_DIR: &str = "prompts";
 
 /// Written on first run.
-pub const DEFAULT_PROVIDERS: &str = r#"# 模型供应商。保存后立即生效。
+pub const DEFAULT_PROVIDERS: &str = r#"# 对话供应商。保存后立即生效。
 # 密钥不写在这里：它存在 Windows 凭据管理器里，用 `myuri key <id>` 设置。
 #
 # [[provider]]
@@ -29,15 +34,9 @@ pub const DEFAULT_PROVIDERS: &str = r#"# 模型供应商。保存后立即生效
 # models = ["gpt-4o-mini"]               # 可选，供切换模型时挑选
 # group = "原厂"                         # 可选，切换模型时按它分组
 # icon = "openai"                        # 可选，不写就自动匹配；Lobe Icons 的名字、图片路径或网址
-# speech_api = "elevenlabs"              # 语音接口：elevenlabs、soniox、openai
-# asr_models = ["scribe_v3"]             # 语音识别模型
-# tts_models = ["eleven_v4"]             # 语音合成模型
 # vertex = true                          # Google Vertex AI：api 写 "gemini"，base_url 写到
 #                                        # .../projects/项目/locations/global/publishers/google，
 #                                        # 密钥处填服务账号的 JSON
-# image_models = ["gpt-image-2.6-flare"] # 可选，生图模型
-# image_api = "openai"                   # 生图接口：openai、xai、gemini、evolink、wavespeed
-#                                        # 不写时跟着 api 走
 # 多把密钥：myuri key 时用逗号隔开。下面按存入的顺序给它们写备注、单独停用。
 # keys = [{ note = "主账号" }, { note = "备用", enabled = false }]
 # key_strategy = "fallback"              # fallback 第一把出问题才换下一把（默认）
@@ -46,6 +45,37 @@ pub const DEFAULT_PROVIDERS: &str = r#"# 模型供应商。保存后立即生效
 #
 # 收藏的模型排在切换列表最前面。这一行要写在所有 [[provider]] 之前：
 # favorites = ["openai/gpt-4o-mini"]
+"#;
+
+pub const DEFAULT_IMAGE_PROVIDERS: &str = r#"# 生图供应商。密钥用 `myuri key --image <id>` 设置。
+# favorites = ["example/gpt-image-1"]
+#
+# [[provider]]
+# id = "example"
+# api = "openai"                       # 或 gemini、xai、evolink、wavespeed
+# base_url = "https://api.openai.com/v1"
+# models = ["gpt-image-1"]
+# default_size = "1024x1024"
+# default_resolution = "1K"
+# default_quality = "medium"
+# default_format = "png"
+"#;
+
+pub const DEFAULT_SPEECH_PROVIDERS: &str = r#"# 语音供应商。密钥用 `myuri key --speech <id>` 设置。
+#
+# [[provider]]
+# id = "example"
+# api = "elevenlabs"                    # 或 soniox、openai
+# base_url = "https://api.elevenlabs.io/v1"
+# asr_models = ["scribe_v1"]
+# tts_models = ["eleven_multilingual_v2"]
+# voice = ""
+# stability = 0.5
+# similarity_boost = 0.75
+# style = 0.0
+# speed = 1.0
+# language = "auto"
+# output_format = "pcm_24000"
 "#;
 
 /// Written on first run. Must stay equal to `Settings::default()`.
@@ -86,6 +116,10 @@ theme = "system"
 # 不写就不显示麦克风和朗读按钮。
 # asr = "soniox/stt-async-v6"
 # tts = "elevenlabs/eleven_v4"
+
+[image]
+# 默认生图模型，写法是 "供应商 id/模型名"。
+# default = "openai/gpt-image-1"
 
 [sync]
 # 备份放在哪个 WebDAV 文件夹。密码存在 Windows 凭据管理器里，在设置窗口里填。
@@ -165,11 +199,20 @@ pub struct Settings {
     pub hotkey: HotkeySettings,
     pub capture: CaptureSettings,
     pub panel: PanelSettings,
+    pub image: ImageSettings,
     pub speech: SpeechSettings,
     pub sync: SyncSettings,
     pub log: LogSettings,
     /// Tier name to model reference, e.g. `fast = "openai/gpt-4o-mini"`.
     pub models: BTreeMap<String, String>,
+}
+
+/// Which provider and model generate or edit pictures by default.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImageSettings {
+    /// `provider/model` used by default for image generation and editing.
+    pub default: Option<String>,
 }
 
 /// Where a copy of the configuration is kept. The password is in the
@@ -257,7 +300,7 @@ pub struct PanelSettings {
     pub theme: ThemeChoice,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
     #[default]
@@ -324,7 +367,7 @@ fn send_default() -> Vec<ContentKind> {
     vec![ContentKind::Text, ContentKind::Image]
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyStrategy {
     /// Always the first key; the next one only when it fails.
@@ -336,7 +379,7 @@ pub enum KeyStrategy {
     Sticky,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyNote {
     #[serde(default)]
@@ -345,9 +388,10 @@ pub struct KeyNote {
     pub enabled: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeechApi {
+    #[default]
     Elevenlabs,
     Soniox,
     Openai,
@@ -363,8 +407,9 @@ impl SpeechApi {
     }
 }
 
-/// What a provider can be used for. One provider may serve several.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The independent configuration and model list to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Purpose {
     Chat,
     Images,
@@ -372,25 +417,6 @@ pub enum Purpose {
 }
 
 impl Provider {
-    pub fn serves(&self, purpose: Purpose) -> bool {
-        let images = !self.image_models.is_empty() || self.image_api.is_some();
-        let speech = self.speech_api.is_some();
-        match purpose {
-            // A provider with nothing listed yet is taken to be for chat.
-            Purpose::Chat => !self.models.is_empty() || (!images && !speech),
-            Purpose::Images => images,
-            Purpose::Speech => speech,
-        }
-    }
-
-    /// How many models it lists for a purpose.
-    pub fn model_count(&self, purpose: Purpose) -> usize {
-        match purpose {
-            Purpose::Chat => self.models.len(),
-            Purpose::Images => self.image_models.len(),
-            Purpose::Speech => self.asr_models.len() + self.tts_models.len(),
-        }
-    }
 
     pub fn image_api(&self) -> crate::image::ImageApi {
         use crate::image::ImageApi;
@@ -404,22 +430,31 @@ impl Provider {
     /// credential store holds, `turn` counts requests (or conversations, for
     /// sticky) made through this provider.
     pub fn keys_to_try<'a>(&self, stored: &'a str, turn: usize) -> Vec<&'a str> {
-        // A service account is one piece of JSON, commas and all.
-        if self.vertex {
-            return vec![stored.trim()].into_iter().filter(|account| !account.is_empty()).collect();
-        }
-        let enabled = |index: usize| self.keys.get(index).is_none_or(|note| note.enabled);
-        let mut keys: Vec<&str> = crate::llm::split_keys(stored)
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, key)| enabled(index).then_some(key))
-            .collect();
-        if self.key_strategy != KeyStrategy::Fallback && !keys.is_empty() {
-            let start = turn % keys.len();
-            keys.rotate_left(start);
-        }
-        keys
+        keys_to_try(stored, turn, self.vertex, self.key_strategy, &self.keys)
     }
+}
+
+fn keys_to_try<'a>(
+    stored: &'a str,
+    turn: usize,
+    vertex: bool,
+    strategy: KeyStrategy,
+    notes: &[KeyNote],
+) -> Vec<&'a str> {
+    if vertex {
+        let account = stored.trim();
+        return (!account.is_empty()).then_some(account).into_iter().collect();
+    }
+    let mut keys: Vec<&str> = crate::llm::split_keys(stored)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, key)| notes.get(index).is_none_or(|note| note.enabled).then_some(key))
+        .collect();
+    if strategy != KeyStrategy::Fallback && !keys.is_empty() {
+        let start = turn % keys.len();
+        keys.rotate_left(start);
+    }
+    keys
 }
 
 /// How hard a model thinks, weakest first.
@@ -540,6 +575,153 @@ pub struct Provider {
     pub enabled: bool,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_default_key_strategy(value: &KeyStrategy) -> bool {
+    *value == KeyStrategy::default()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImageProvider {
+    pub id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub api: crate::image::ImageApi,
+    pub base_url: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub vertex: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_size: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_resolution: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_quality: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_format: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    #[serde(skip_serializing_if = "is_default_key_strategy")]
+    pub key_strategy: KeyStrategy,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<KeyNote>,
+    #[serde(skip_serializing_if = "is_true")]
+    pub enabled: bool,
+}
+
+impl Default for ImageProvider {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            api: Default::default(),
+            base_url: String::new(),
+            headers: BTreeMap::new(),
+            models: Vec::new(),
+            vertex: false,
+            default_size: String::new(),
+            default_resolution: String::new(),
+            default_quality: String::new(),
+            default_format: String::new(),
+            group: String::new(),
+            icon: String::new(),
+            key_strategy: Default::default(),
+            keys: Vec::new(),
+            enabled: true,
+        }
+    }
+}
+
+impl ImageProvider {
+    pub fn keys_to_try<'a>(&self, stored: &'a str, turn: usize) -> Vec<&'a str> {
+        keys_to_try(stored, turn, self.vertex, self.key_strategy, &self.keys)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpeechProvider {
+    pub id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub api: SpeechApi,
+    pub base_url: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub asr_models: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tts_models: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub voice: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stability: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity_boost: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub language: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub output_format: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    #[serde(skip_serializing_if = "is_default_key_strategy")]
+    pub key_strategy: KeyStrategy,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<KeyNote>,
+    #[serde(skip_serializing_if = "is_true")]
+    pub enabled: bool,
+}
+
+impl Default for SpeechProvider {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            api: Default::default(),
+            base_url: String::new(),
+            headers: BTreeMap::new(),
+            asr_models: Vec::new(),
+            tts_models: Vec::new(),
+            voice: String::new(),
+            stability: None,
+            similarity_boost: None,
+            style: None,
+            speed: None,
+            language: String::new(),
+            output_format: String::new(),
+            group: String::new(),
+            icon: String::new(),
+            key_strategy: Default::default(),
+            keys: Vec::new(),
+            enabled: true,
+        }
+    }
+}
+
+impl SpeechProvider {
+    pub fn keys_to_try<'a>(&self, stored: &'a str, turn: usize) -> Vec<&'a str> {
+        keys_to_try(stored, turn, false, self.key_strategy, &self.keys)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProvidersFile {
@@ -548,6 +730,22 @@ struct ProvidersFile {
     favorites: Vec<String>,
     #[serde(default)]
     provider: Vec<Provider>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageProvidersFile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    favorites: Vec<String>,
+    #[serde(default)]
+    provider: Vec<ImageProvider>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeechProvidersFile {
+    #[serde(default)]
+    provider: Vec<SpeechProvider>,
 }
 
 /// A model reference split into provider id and model name.
@@ -570,9 +768,13 @@ impl Settings {
     /// The model an assistant uses: its own reference or tier, else the
     /// `default` tier.
     pub fn model_for(&self, assistant: &Assistant) -> Result<ModelRef, String> {
-        let name = &assistant.name;
-        let written = match &assistant.model {
-            Some(written) => written.as_str(),
+        self.resolve_assistant_model(&assistant.name, assistant.model.as_deref())
+    }
+
+    /// Resolve a saved assistant selection or a draft from the settings form.
+    pub fn resolve_assistant_model(&self, name: &str, model: Option<&str>) -> Result<ModelRef, String> {
+        let written = match model {
+            Some(written) => written,
             None => self
                 .models
                 .get("default")
@@ -679,29 +881,74 @@ pub fn parse_assistants(source: &str) -> Result<Vec<Assistant>, String> {
 
 /// Every provider in file order, including disabled ones.
 pub fn parse_providers(source: &str) -> Result<Vec<Provider>, String> {
+    parse_providers_file(source).map(|file| file.provider)
+}
+
+fn parse_providers_file(source: &str) -> Result<ProvidersFile, String> {
     let mut file: ProvidersFile = toml::from_str(source).map_err(|e| describe(source, &e))?;
-    let mut seen = Vec::new();
+    let mut seen = BTreeSet::new();
     for provider in &mut file.provider {
-        let id = provider.id.clone();
-        // The id is the part of a model reference before the slash.
-        let valid = !id.is_empty()
-            && id.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
-        if !valid {
-            return Err(format!("供应商 id \"{id}\" 只能用字母、数字、-、_ 和 ."));
-        }
-        if seen.contains(&id) {
-            return Err(format!("供应商 id \"{id}\" 重复了"));
-        }
-        if !provider.base_url.starts_with("https://") && !provider.base_url.starts_with("http://") {
-            return Err(format!("供应商 \"{id}\" 的 base_url 要以 http:// 或 https:// 开头"));
-        }
-        provider.base_url = provider.base_url.trim_end_matches('/').to_string();
-        if provider.name.trim().is_empty() {
-            provider.name = id.clone();
-        }
-        seen.push(id);
+        validate_provider(&provider.id, &mut provider.name, &mut provider.base_url, &mut seen)?;
+    }
+    Ok(file)
+}
+
+pub fn parse_image_providers(source: &str) -> Result<Vec<ImageProvider>, String> {
+    let mut file: ImageProvidersFile = toml::from_str(source).map_err(|e| describe(source, &e))?;
+    let mut seen = BTreeSet::new();
+    for provider in &mut file.provider {
+        validate_provider(&provider.id, &mut provider.name, &mut provider.base_url, &mut seen)?;
     }
     Ok(file.provider)
+}
+
+pub fn parse_speech_providers(source: &str) -> Result<Vec<SpeechProvider>, String> {
+    let mut file: SpeechProvidersFile = toml::from_str(source).map_err(|e| describe(source, &e))?;
+    let mut seen = BTreeSet::new();
+    for provider in &mut file.provider {
+        validate_provider(&provider.id, &mut provider.name, &mut provider.base_url, &mut seen)?;
+        for (field, value, min, max) in [
+            ("stability", provider.stability, 0.0, 1.0),
+            ("similarity_boost", provider.similarity_boost, 0.0, 1.0),
+            ("style", provider.style, 0.0, 1.0),
+            ("speed", provider.speed, 0.25, 2.0),
+        ] {
+            if value.is_some_and(|value| !(min..=max).contains(&value)) {
+                return Err(format!("供应商 \"{}\" 的 {field} 要在 {min} 到 {max} 之间", provider.id));
+            }
+        }
+        if provider.api == SpeechApi::Elevenlabs && !provider.output_format.trim().is_empty() {
+            crate::speech::validate_elevenlabs_format(&provider.output_format)
+                .map_err(|reason| format!("供应商 \"{}\" 的 output_format 无效：{reason}", provider.id))?;
+        }
+    }
+    Ok(file.provider)
+}
+
+pub fn valid_provider_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn validate_provider(
+    id: &str,
+    name: &mut String,
+    base_url: &mut String,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    if !valid_provider_id(id) {
+        return Err(format!("供应商 id \"{id}\" 只能用字母、数字、-、_ 和 ."));
+    }
+    if !seen.insert(id.to_string()) {
+        return Err(format!("供应商 id \"{id}\" 重复了"));
+    }
+    if !base_url.starts_with("https://") && !base_url.starts_with("http://") {
+        return Err(format!("供应商 \"{id}\" 的 base_url 要以 http:// 或 https:// 开头"));
+    }
+    base_url.truncate(base_url.trim_end_matches('/').len());
+    if name.trim().is_empty() {
+        *name = id.to_string();
+    }
+    Ok(())
 }
 
 fn describe(source: &str, error: &toml::de::Error) -> String {
@@ -816,6 +1063,149 @@ pub fn load_providers(dir: &Path) -> Result<Vec<Provider>, Problem> {
     })
 }
 
+pub fn load_image_providers(dir: &Path) -> Result<Vec<ImageProvider>, Problem> {
+    read(dir, IMAGE_PROVIDERS_FILE).and_then(|source| {
+        parse_image_providers(&source).map_err(|message| Problem { file: IMAGE_PROVIDERS_FILE, message })
+    })
+}
+
+pub fn load_speech_providers(dir: &Path) -> Result<Vec<SpeechProvider>, Problem> {
+    read(dir, SPEECH_PROVIDERS_FILE).and_then(|source| {
+        parse_speech_providers(&source).map_err(|message| Problem { file: SPEECH_PROVIDERS_FILE, message })
+    })
+}
+
+/// Create missing image and speech files from the old provider list.
+/// Returns the credential destinations for just the entries it migrated.
+pub fn migrate_split_providers(dir: &Path) -> Result<Vec<(&'static str, String)>, String> {
+    migrate_split_providers_with(dir, &[], |_, _| Ok(()))
+}
+
+/// Prepare credentials before publishing each new file so a credential
+/// write error can be retried. Restoring a legacy backup can also replace
+/// the untouched default templates for split files absent from that backup.
+pub fn migrate_split_providers_with(
+    dir: &Path,
+    replace_defaults: &[&str],
+    mut prepare: impl FnMut(&'static str, &str) -> Result<(), String>,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let image_file = dir.join(IMAGE_PROVIDERS_FILE);
+    let speech_file = dir.join(SPEECH_PROVIDERS_FILE);
+    let image_missing = !image_file.try_exists().map_err(|e| e.to_string())?;
+    let speech_missing = !speech_file.try_exists().map_err(|e| e.to_string())?;
+    let replace_image = !image_missing
+        && replace_defaults.contains(&IMAGE_PROVIDERS_FILE)
+        && fs::read(&image_file).map_err(|e| e.to_string())? == DEFAULT_IMAGE_PROVIDERS.as_bytes();
+    let replace_speech = !speech_missing
+        && replace_defaults.contains(&SPEECH_PROVIDERS_FILE)
+        && fs::read(&speech_file).map_err(|e| e.to_string())? == DEFAULT_SPEECH_PROVIDERS.as_bytes();
+    if !image_missing && !speech_missing && !replace_image && !replace_speech {
+        return Ok(Vec::new());
+    }
+    let source = match fs::read_to_string(dir.join(PROVIDERS_FILE)) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("{PROVIDERS_FILE}：{error}")),
+    };
+    let source = source.trim_start_matches('\u{feff}');
+    let ProvidersFile { favorites, provider: providers } = parse_providers_file(source)?;
+    let mut migrated = Vec::new();
+    if image_missing || replace_image {
+        let provider: Vec<_> = providers.iter()
+            .filter(|p| p.image_api.is_some() || !p.image_models.is_empty())
+            .map(|p| ImageProvider {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                api: p.image_api(),
+                base_url: p.base_url.clone(),
+                headers: p.headers.clone(),
+                models: p.image_models.clone(),
+                vertex: p.vertex,
+                group: p.group.clone(),
+                icon: p.icon.clone(),
+                key_strategy: p.key_strategy,
+                keys: p.keys.clone(),
+                enabled: p.enabled,
+                ..ImageProvider::default()
+            })
+            .collect();
+        let favorites = favorites.into_iter().filter(|value| {
+            ModelRef::parse(value).is_some_and(|reference| {
+                provider.iter().any(|p| p.id == reference.provider && p.models.contains(&reference.model))
+            })
+        }).collect();
+        let file = ImageProvidersFile { favorites, provider };
+        if file.provider.is_empty() {
+            if image_missing {
+                write_migrated(&image_file, DEFAULT_IMAGE_PROVIDERS, None)?;
+            }
+        } else {
+            let source = toml::to_string_pretty(&file).map_err(|e| e.to_string())?;
+            for p in &file.provider {
+                prepare(NS_IMAGE, &p.id)?;
+                migrated.push((NS_IMAGE, p.id.clone()));
+            }
+            write_migrated(&image_file, &source, replace_image.then_some(DEFAULT_IMAGE_PROVIDERS))?;
+        }
+    }
+    if speech_missing || replace_speech {
+        let provider: Vec<_> = providers.into_iter()
+            .filter_map(|p| Some(SpeechProvider {
+                api: p.speech_api?,
+                id: p.id,
+                name: p.name,
+                base_url: p.base_url,
+                headers: p.headers,
+                asr_models: p.asr_models,
+                tts_models: p.tts_models,
+                voice: p.voice,
+                group: p.group,
+                icon: p.icon,
+                key_strategy: p.key_strategy,
+                keys: p.keys,
+                enabled: p.enabled,
+                ..SpeechProvider::default()
+            }))
+            .collect();
+        let file = SpeechProvidersFile { provider };
+        if file.provider.is_empty() {
+            if speech_missing {
+                write_migrated(&speech_file, DEFAULT_SPEECH_PROVIDERS, None)?;
+            }
+        } else {
+            let source = toml::to_string_pretty(&file).map_err(|e| e.to_string())?;
+            for p in file.provider {
+                prepare(NS_SPEECH, &p.id)?;
+                migrated.push((NS_SPEECH, p.id));
+            }
+            write_migrated(&speech_file, &source, replace_speech.then_some(DEFAULT_SPEECH_PROVIDERS))?;
+        }
+    }
+    Ok(migrated)
+}
+
+fn write_migrated(path: &Path, contents: &str, previous: Option<&str>) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(previous) = previous {
+        if fs::read(path).map_err(|e| e.to_string())? != previous.as_bytes() {
+            return Err("恢复备份时渠道配置已更改，请重新导入".into());
+        }
+        if let Err(error) = fs::write(path, contents) {
+            fs::write(path, previous).map_err(|rollback| format!("{error}，恢复原配置失败：{rollback}"))?;
+            return Err(error.to_string());
+        }
+        return Ok(());
+    }
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = file.write_all(contents.as_bytes()) {
+        drop(file);
+        fs::remove_file(path).map_err(|cleanup| format!("{error}，清理未写完的配置失败：{cleanup}"))?;
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
 /// `source`, the text of the providers file, with the model lists of provider
 /// `id` replaced. Everything else in the file, comments included, stays.
 pub fn with_models(
@@ -826,7 +1216,8 @@ pub fn with_models(
 ) -> Result<String, String> {
     use toml_edit::{Array, DocumentMut, Value, value};
     let mut document: DocumentMut =
-        source.parse().map_err(|error: toml_edit::TomlError| error.to_string())?;
+        source.trim_start_matches('\u{feff}').parse()
+            .map_err(|error: toml_edit::TomlError| error.to_string())?;
     let table = document
         .get_mut("provider")
         .and_then(|item| item.as_array_of_tables_mut())
@@ -861,6 +1252,14 @@ pub fn load_favorites(dir: &Path) -> Vec<ModelRef> {
         .unwrap_or_default()
 }
 
+pub fn load_image_favorites(dir: &Path) -> Vec<ModelRef> {
+    fs::read_to_string(dir.join(IMAGE_PROVIDERS_FILE))
+        .ok()
+        .and_then(|source| toml::from_str::<ImageProvidersFile>(source.trim_start_matches('\u{feff}')).ok())
+        .map(|file| file.favorites.iter().filter_map(|entry| ModelRef::parse(entry)).collect())
+        .unwrap_or_default()
+}
+
 /// The system prompt of an assistant. A missing file is an empty prompt.
 pub fn load_prompt(dir: &Path, assistant: &Assistant) -> String {
     fs::read_to_string(dir.join(assistant.prompt_path()))
@@ -882,6 +1281,8 @@ mod tests {
     #[test]
     fn shipped_defaults_parse_and_match_the_code() {
         assert_eq!(parse_settings(DEFAULT_SETTINGS), Ok(Settings::default()));
+        assert_eq!(parse_image_providers(DEFAULT_IMAGE_PROVIDERS), Ok(Vec::new()));
+        assert_eq!(parse_speech_providers(DEFAULT_SPEECH_PROVIDERS), Ok(Vec::new()));
         assert_eq!(parse_settings(""), Ok(Settings::default()));
         let assistants = parse_assistants(DEFAULT_ASSISTANTS).unwrap();
         assert_eq!(assistants.len(), 7);
@@ -917,22 +1318,75 @@ mod tests {
         let emptied = with_models(&updated, "a", &[], &[]).unwrap();
         assert!(parse_providers(&emptied).unwrap()[0].models.is_empty());
         assert!(with_models(source, "nope", &[], &[]).is_err());
+        assert!(with_models(&format!("\u{feff}{source}"), "a", &[], &[]).is_ok());
     }
 
     #[test]
-    fn providers_serve_by_what_they_list() {
-        let base = "[[provider]]\nid = \"a\"\nbase_url = \"https://a.test\"\n";
-        let parse = |extra: &str| parse_providers(&format!("{base}{extra}")).unwrap().remove(0);
-        let empty = parse("");
-        assert_eq!(empty.api, Api::ChatCompletions);
-        assert!(empty.serves(Purpose::Chat) && !empty.serves(Purpose::Images));
-        let both = parse("models = [\"m\"]\nimage_models = [\"i\", \"j\"]\n");
-        assert!(both.serves(Purpose::Chat) && both.serves(Purpose::Images));
-        assert_eq!(both.model_count(Purpose::Images), 2);
-        let voice = parse("speech_api = \"soniox\"\nasr_models = [\"s\"]\ntts_models = [\"t\"]\n");
-        assert!(voice.serves(Purpose::Speech) && !voice.serves(Purpose::Chat));
-        assert_eq!(voice.model_count(Purpose::Speech), 2);
+    fn split_provider_files_validate_independently() {
+        let source = "[[provider]]\nid = \"example\"\nbase_url = \"https://example.test/v1/\"\n";
+        let images = parse_image_providers(source).unwrap();
+        let speech = parse_speech_providers(source).unwrap();
+        assert_eq!(images[0].api, crate::image::ImageApi::Openai);
+        assert_eq!(speech[0].api, SpeechApi::Elevenlabs);
+        assert_eq!(images[0].name, "example");
+        assert_eq!(speech[0].base_url, "https://example.test/v1");
+        assert!(images[0].enabled && speech[0].enabled);
+        assert!(parse_image_providers(&format!("{source}asr_models = []")).is_err());
+        assert!(parse_speech_providers(&format!("{source}image_api = \"openai\"")).is_err());
+        assert!(parse_image_providers(&format!("{source}{source}")).is_err());
+        for entry in ["stability = 1.01", "similarity_boost = -0.01", "style = nan", "speed = 0.24"] {
+            assert!(parse_speech_providers(&format!("{source}{entry}")).is_err());
+        }
+        assert!(parse_speech_providers(&format!("{source}stability = 0.0\nstyle = 1.0\nspeed = 2.0")).is_ok());
     }
+
+    #[test]
+    fn legacy_migration_keeps_shared_ids_and_does_not_repeat() {
+        let dir = std::env::temp_dir().join(format!("myuri-split-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let legacy = r#"favorites = ["example/chat", "example/picture"]
+[[provider]]
+id = "example"
+api = "gemini"
+base_url = "https://example.test/v1/"
+models = ["chat"]
+image_models = ["picture"]
+speech_api = "elevenlabs"
+tts_models = ["reader"]
+voice = "example-voice"
+keys = [{ note = "spare", enabled = false }]
+key_strategy = "round_robin"
+vertex = true
+"#;
+        fs::write(dir.join(PROVIDERS_FILE), legacy).unwrap();
+        assert!(migrate_split_providers_with(&dir, &[], |_, _| Err("simulated write failure".into())).is_err());
+        assert!(!dir.join(IMAGE_PROVIDERS_FILE).exists());
+        assert_eq!(migrate_split_providers(&dir).unwrap(), [(NS_IMAGE, "example".into()), (NS_SPEECH, "example".into())]);
+        assert_eq!(fs::read_to_string(dir.join(PROVIDERS_FILE)).unwrap(), legacy);
+        let image = load_image_providers(&dir).unwrap().remove(0);
+        assert_eq!(image.api, crate::image::ImageApi::Gemini);
+        assert_eq!(image.models, ["picture"]);
+        assert!(image.vertex);
+        assert_eq!(image.keys_to_try(r#"{"a":1,"b":2}"#, 0), [r#"{"a":1,"b":2}"#]);
+        assert_eq!(load_image_favorites(&dir), [ModelRef::parse("example/picture").unwrap()]);
+        let speech = load_speech_providers(&dir).unwrap().remove(0);
+        assert_eq!(speech.voice, "example-voice");
+        assert_eq!(speech.tts_models, ["reader"]);
+        assert_eq!(speech.keys_to_try("dummy1,dummy2,dummy3", 1), ["dummy3", "dummy2"]);
+        fs::write(dir.join(SPEECH_PROVIDERS_FILE), DEFAULT_SPEECH_PROVIDERS).unwrap();
+        assert!(migrate_split_providers(&dir).unwrap().is_empty());
+        assert!(load_speech_providers(&dir).unwrap().is_empty());
+        assert_eq!(
+            migrate_split_providers_with(&dir, &[IMAGE_PROVIDERS_FILE, SPEECH_PROVIDERS_FILE], |_, _| Ok(())).unwrap(),
+            [(NS_SPEECH, "example".into())],
+        );
+        assert_eq!(load_speech_providers(&dir).unwrap()[0].voice, "example-voice");
+        for file in [PROVIDERS_FILE, IMAGE_PROVIDERS_FILE, SPEECH_PROVIDERS_FILE] {
+            fs::remove_file(dir.join(file)).unwrap();
+        }
+        fs::remove_dir(dir).unwrap();
+    }
+
 
     #[test]
     fn keys_are_ordered_by_strategy() {
@@ -960,6 +1414,7 @@ mod tests {
         let resolved =
             |model: &str| settings.model_for(&assistant(model)).map(|m| (m.provider, m.model));
         assert_eq!(resolved(""), Ok(("a".into(), "x".into())));
+        assert_eq!(resolved("model = \"default\"\n"), Ok(("a".into(), "x".into())));
         assert_eq!(resolved("model = \"fast\"\n"), Ok(("b".into(), "org/y:free".into())));
         assert_eq!(resolved("model = \"c/z\"\n"), Ok(("c".into(), "z".into())));
         assert!(resolved("model = \"nope\"\n").is_err());

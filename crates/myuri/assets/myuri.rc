@@ -1,2 +1,39 @@
+#include <winresrc.h>
+#include "myuri-version.h"
+
+// Windows and GPUI use icon 1 as the executable and window icon.
 1 ICON "myuri.ico"
 2 ICON "myuri-paused.ico"
+
+// GPUI embeds an en-US manifest. Windows loads the language-neutral manifest
+// into the process application context when it is present.
+LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "myuri.manifest"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION MYURI_VERSION_NUMBER
+    PRODUCTVERSION MYURI_VERSION_NUMBER
+    FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+    FILEFLAGS 0
+    FILEOS VOS_NT_WINDOWS32
+    FILETYPE VFT_APP
+    FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "Myuri"
+            VALUE "FileVersion", MYURI_VERSION_STRING
+            VALUE "InternalName", "myuri"
+            VALUE "OriginalFilename", "myuri.exe"
+            VALUE "ProductName", "Myuri"
+            VALUE "ProductVersion", MYURI_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

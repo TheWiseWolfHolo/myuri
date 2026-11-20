@@ -29,6 +29,7 @@ mod toolsview;
 mod tray;
 mod traymenu;
 mod uia;
+mod updates;
 mod vertex;
 mod watch;
 mod win;
@@ -36,9 +37,11 @@ mod window;
 
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::core::w;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// `%APPDATA%\Myuri`, where the configuration files live.
 pub fn config_dir() -> PathBuf {
@@ -52,16 +55,29 @@ fn main() {
     }
     applog::init();
     // Held until the process exits.
-    let Some(_instance) = single_instance() else {
-        applog::info!("already running; this copy exits");
-        return;
+    let _instance = match single_instance() {
+        Ok(Some(instance)) => instance,
+        Ok(None) => {
+            let sent = tray::send_to_running_instance(tray::Request::Settings);
+            applog::info!("already running; settings request sent: {sent}");
+            return;
+        }
+        Err(error) => {
+            applog::info!("cannot check for a running instance: {error}");
+            return;
+        }
     };
     app::run();
 }
 
-fn single_instance() -> Option<HANDLE> {
+fn single_instance() -> windows::core::Result<Option<HANDLE>> {
     unsafe {
-        let mutex = CreateMutexW(None, true, w!(r"Local\Myuri.SingleInstance")).ok()?;
-        (GetLastError() != ERROR_ALREADY_EXISTS).then_some(mutex)
+        let mutex = CreateMutexW(None, true, w!(r"Local\Myuri.SingleInstance"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(mutex);
+            Ok(None)
+        } else {
+            Ok(Some(mutex))
+        }
     }
 }

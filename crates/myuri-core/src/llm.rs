@@ -283,15 +283,26 @@ pub fn build(api: Api, base_url: &str, key: &str, chat: &ChatRequest) -> HttpReq
                     json!({ "role": role, "content": parts })
                 })
                 .collect();
-            // The reply budget comes on top of whatever is spent thinking.
+            let output = chat.info.and_then(|info| info.output).filter(|&limit| limit > 0);
+            // The output cap includes thinking; reserve room for the visible reply.
             let thinking = match chat.reasoning {
                 Some(Reasoning::None) | None => 0,
-                Some(level) => chat.info.cloned().unwrap_or_default().budget_for(level),
+                Some(level) => chat.info.map_or_else(
+                    || ModelInfo::default().budget_for(level),
+                    |info| info.budget_for(level),
+                ),
             };
+            let thinking = output.map_or(thinking, |limit| {
+                let reserve = (limit / 4).clamp(1, 4_096);
+                thinking.min(limit.saturating_sub(reserve))
+            });
+            // Anthropic requires a thinking budget of at least 1024 tokens.
+            let thinking = if thinking >= 1_024 { thinking } else { 0 };
+            let max_tokens = 8_192u32.saturating_add(thinking).min(output.unwrap_or(u32::MAX));
             let mut body = json!({
                 "model": chat.model,
                 "stream": true,
-                "max_tokens": 8_192 + thinking,
+                "max_tokens": max_tokens,
                 "messages": messages,
             });
             if !chat.system.is_empty() {
@@ -378,16 +389,15 @@ pub fn build(api: Api, base_url: &str, key: &str, chat: &ChatRequest) -> HttpReq
             (format!("/models/{}:streamGenerateContent?alt=sse", chat.model), body)
         }
     };
-    // Anthropic rejects a temperature while thinking is on.
-    if let Some(temperature) = chat.temperature {
-        if body.get("thinking").is_none() {
-            // Widening 0.2f32 as it stands would send 0.20000000298023224.
-            let rounded = json!((f64::from(temperature) * 1000.0).round() / 1000.0);
-            if api == Api::Gemini {
-                body["generationConfig"]["temperature"] = rounded;
-            } else {
-                body["temperature"] = rounded;
-            }
+    let accepts_temperature = !chat.info.is_some_and(|info| info.temperature == Some(false))
+        && ["thinking", "reasoning_effort", "reasoning"].iter().all(|&field| body.get(field).is_none());
+    if let Some(temperature) = chat.temperature.filter(|_| accepts_temperature) {
+        // Widening 0.2f32 as it stands would send 0.20000000298023224.
+        let rounded = json!((f64::from(temperature) * 1000.0).round() / 1000.0);
+        if api == Api::Gemini {
+            body["generationConfig"]["temperature"] = rounded;
+        } else {
+            body["temperature"] = rounded;
         }
     }
     HttpRequest { url: format!("{base}{path}"), headers, body }
@@ -654,24 +664,61 @@ pub fn parse_models(body: &str) -> Result<Vec<String>, String> {
     if let Some(message) = error_message(&value) {
         return Err(message);
     }
-    let list = [&value["data"], &value["models"], &value]
+    let list = [&value["data"], &value["models"], &value["publisherModels"], &value]
         .into_iter()
         .find_map(Value::as_array)
         .ok_or_else(unreadable)?;
     let mut names: Vec<String> = Vec::new();
     for entry in list {
         // Gemini lists embedding models too, marked by what they can be asked.
+        // Keep chat (`generateContent`) and image (`predict` / `generateImages`) models.
         let methods = entry["supportedGenerationMethods"].as_array();
-        if methods.is_some_and(|methods| !methods.iter().any(|method| method == "generateContent")) {
+        if methods.is_some_and(|methods| {
+            !methods.iter().any(|method| {
+                matches!(method.as_str(), Some("generateContent" | "predict" | "generateImages"))
+            })
+        }) {
             continue;
         }
         let name = entry["id"].as_str().or(entry["name"].as_str()).or(entry.as_str()).unwrap_or("");
-        let name = name.trim_start_matches("models/");
+        let name = name.rsplit_once("/models/").map_or_else(|| name.trim_start_matches("models/"), |(_, tail)| tail);
         if !name.is_empty() && !names.iter().any(|known| known == name) {
             names.push(name.to_string());
         }
     }
     Ok(names)
+}
+
+/// The URL of the next page of models, if the reply indicates more exist.
+pub fn next_models_page(api: Api, base_url: &str, body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let base = base_url.trim_end_matches('/');
+    match api {
+        Api::Anthropic => {
+            if value["has_more"] != true {
+                return None;
+            }
+            let after = value["last_id"].as_str().filter(|s| !s.is_empty())?;
+            Some(format!("{base}/models?limit=1000&after_id={}", url_encode(after)))
+        }
+        Api::Gemini => {
+            let token = value["nextPageToken"].as_str().filter(|s| !s.is_empty())?;
+            Some(format!("{base}/models?pageSize=1000&pageToken={}", url_encode(token)))
+        }
+        Api::ChatCompletions | Api::Responses => None,
+    }
+}
+
+pub(crate) fn url_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Every key in a stored field: several are separated by commas.
@@ -749,7 +796,7 @@ mod tests {
         assert_eq!(http.body["messages"][2]["role"], "assistant");
         assert_eq!(http.body["messages"][3]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD");
         assert_eq!(http.body["reasoning_effort"], "low");
-        assert_eq!(http.body["temperature"], 0.5);
+        assert!(http.body.get("temperature").is_none());
         assert_eq!(http.body["stream"], true);
     }
 
@@ -758,6 +805,7 @@ mod tests {
         let turns = [Turn { pictures: vec![picture()], ..Turn::user("see") }, Turn::assistant("ok")];
         let mut request = chat(&turns);
         request.reasoning = Some(Reasoning::High);
+        request.temperature = Some(0.6);
         let http = build(Api::Responses, "https://x.test/v1", "k", &request);
         assert_eq!(http.url, "https://x.test/v1/responses");
         assert_eq!(http.body["instructions"], "be brief");
@@ -765,6 +813,23 @@ mod tests {
         assert_eq!(http.body["input"][0]["content"][1]["type"], "input_image");
         assert_eq!(http.body["input"][1]["content"][0]["type"], "output_text");
         assert_eq!(http.body["reasoning"]["effort"], "high");
+        assert!(http.body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn temperature_follows_catalog_support() {
+        let turns = [Turn::user("hi")];
+        let mut request = chat(&turns);
+        request.temperature = Some(0.6);
+        let http = build(Api::ChatCompletions, "https://x.test/v1", "k", &request);
+        assert_eq!(http.body["temperature"], 0.6);
+        let info = ModelInfo { temperature: Some(false), ..ModelInfo::default() };
+        request.info = Some(&info);
+        for api in [Api::ChatCompletions, Api::Responses, Api::Anthropic, Api::Gemini] {
+            let http = build(api, "https://x.test/v1", "k", &request);
+            assert!(http.body.get("temperature").is_none());
+            assert!(http.body["generationConfig"].get("temperature").is_none());
+        }
     }
 
     #[test]
@@ -786,6 +851,18 @@ mod tests {
         assert_eq!(http.body["thinking"]["budget_tokens"], 8000);
         assert_eq!(http.body["max_tokens"], 16192);
         assert!(http.body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn anthropic_output_cap_includes_thinking() {
+        let turns = [Turn::user("hi")];
+        let mut request = chat(&turns);
+        request.reasoning = Some(Reasoning::Medium);
+        let info = ModelInfo { output: Some(4_096), ..ModelInfo::default() };
+        request.info = Some(&info);
+        let body = build(Api::Anthropic, "https://x.test/v1", "k", &request).body;
+        assert_eq!(body["max_tokens"], 4_096);
+        assert_eq!(body["thinking"]["budget_tokens"], 3_072);
     }
 
     #[test]
@@ -937,9 +1014,38 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         assert_eq!(
             names(
                 r#"{"models":[{"name":"models/g-1","supportedGenerationMethods":["generateContent"]},
+                {"name":"models/imagen-4","supportedGenerationMethods":["predict"]},
                 {"name":"models/embed","supportedGenerationMethods":["embedContent"]}]}"#
             ),
-            ["g-1"]
+            ["g-1", "imagen-4"]
+        );
+        assert_eq!(
+            names(r#"{"publisherModels":[{"name":"publishers/google/models/gemini-4-neon"}]}"#),
+            ["gemini-4-neon"]
+        );
+        assert_eq!(
+            next_models_page(
+                Api::Anthropic,
+                "https://api.anthropic.com/v1/",
+                r#"{"data":[{"id":"claude-1"}],"has_more":true,"last_id":"claude/1"}"#
+            ),
+            Some("https://api.anthropic.com/v1/models?limit=1000&after_id=claude%2F1".into())
+        );
+        assert_eq!(
+            next_models_page(
+                Api::Anthropic,
+                "https://api.anthropic.com/v1",
+                r#"{"data":[],"has_more":false,"last_id":"claude-1"}"#
+            ),
+            None
+        );
+        assert_eq!(
+            next_models_page(
+                Api::Gemini,
+                "https://g.test/v1beta/",
+                r#"{"models":[],"nextPageToken":"abc+1="}"#
+            ),
+            Some("https://g.test/v1beta/models?pageSize=1000&pageToken=abc%2B1%3D".into())
         );
         assert_eq!(names(r#"[{"id":"x"},"y"]"#), ["x", "y"]);
         assert_eq!(parse_models(r#"{"error":{"message":"bad key"}}"#), Err("bad key".into()));

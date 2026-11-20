@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::{
@@ -11,18 +11,14 @@ use gpui_kit::{
     PathPromptOptions, Render, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
-use myuri_core::backup::{self, Bundle};
+use myuri_core::backup::{self, Bundle, WEBDAV_KEY};
 use myuri_core::config;
 use myuri_core::edit::{self, Field};
 
 use crate::historyview::now;
 use crate::settings::{boxed, button, field, heading, switch};
 use crate::theme::Palette;
-use crate::{net, secrets};
-
-/// Where the WebDAV password is kept in the credential store. Not a valid
-/// provider id, so it cannot collide with one.
-const WEBDAV_SECRET: &str = "@webdav";
+use crate::{app, net, secrets};
 
 /// The files on disk were replaced by those of a backup.
 pub struct Restored;
@@ -53,21 +49,30 @@ struct Recipe {
 
 impl Recipe {
     fn pack(&self) -> Result<Vec<u8>, String> {
-        let files = backup::collect(&self.dir, self.with_history);
-        let keys: BTreeMap<String, String> = match &self.lock {
-            None => BTreeMap::new(),
-            Some(_) => config::load_providers(&self.dir)
-                .map_err(|problem| problem.to_string())?
-                .iter()
-                .filter_map(|provider| secrets::read(&provider.id).map(|key| (provider.id.clone(), key)))
-                .collect(),
-        };
+        let files = backup::collect(&self.dir, self.with_history)?;
+        let mut keys = BTreeMap::new();
+        if self.lock.is_some() {
+            let problem = |problem: config::Problem| problem.to_string();
+            let chat = config::load_providers(&self.dir).map_err(problem)?;
+            let images = config::load_image_providers(&self.dir).map_err(problem)?;
+            let speech = config::load_speech_providers(&self.dir).map_err(problem)?;
+
+            for (namespace, id) in chat.into_iter().map(|provider| (secrets::NS_CHAT, provider.id))
+                .chain(images.into_iter().map(|provider| (secrets::NS_IMAGE, provider.id)))
+                .chain(speech.into_iter().map(|provider| (secrets::NS_SPEECH, provider.id)))
+            {
+                if let Some(key) = secrets::read_in(namespace, &id) {
+                    let name = if namespace == secrets::NS_CHAT { id } else { format!("{namespace}:{id}") };
+                    keys.insert(name, key);
+                }
+            }
+        }
         backup::pack(&files, self.lock.as_deref().map(|lock| (&keys, lock)), now())
     }
 }
 
 /// Put a backup's files and keys in place. Returns what to tell the user.
-fn restore(dir: &PathBuf, bytes: &[u8], lock: &str) -> Result<String, String> {
+fn restore(dir: &Path, bytes: &[u8], lock: &str) -> Result<String, String> {
     let bundle = Bundle::open(bytes)?;
     // A wrong password stops everything before any file changes.
     let keys = match bundle.has_keys() {
@@ -75,10 +80,19 @@ fn restore(dir: &PathBuf, bytes: &[u8], lock: &str) -> Result<String, String> {
         true => bundle.keys(lock)?,
         false => BTreeMap::new(),
     };
+    let credentials: Vec<_> = keys.iter().map(|(name, key)| {
+        backup::provider_credential(name).map(|(namespace, id)| (namespace, id, key))
+            .ok_or_else(|| "备份里有无效的密钥条目".to_string())
+    }).collect::<Result<_, _>>()?;
     let files = bundle.restore(dir, now())?;
-    for (provider, key) in &keys {
-        secrets::write(provider, key)?;
+    for (namespace, id, key) in credentials {
+        secrets::write_in(namespace, id, key)?;
     }
+    let replace_defaults: Vec<_> = [config::IMAGE_PROVIDERS_FILE, config::SPEECH_PROVIDERS_FILE]
+        .into_iter()
+        .filter(|name| bundle.contains_file(config::PROVIDERS_FILE) && !bundle.contains_file(name))
+        .collect();
+    app::migrate_providers(dir, &replace_defaults)?;
     Ok(match keys.len() {
         0 => format!("恢复了 {files} 个文件"),
         count => format!("恢复了 {files} 个文件和 {count} 个渠道的密钥"),
@@ -94,6 +108,11 @@ fn basic(user: &str, password: &str) -> Vec<(String, String)> {
 }
 
 impl SyncView {
+    pub fn set_palette(&mut self, palette: Palette, cx: &mut Context<Self>) {
+        self.palette = palette;
+        cx.notify();
+    }
+
     pub fn new(dir: PathBuf, palette: Palette, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = config::load_settings(&dir).map(|settings| settings.sync).unwrap_or_default();
         let mut line = |hint: &'static str, value: &str, masked: bool| {
@@ -104,7 +123,7 @@ impl SyncView {
                 input
             })
         };
-        let stored = secrets::read(WEBDAV_SECRET).is_some();
+        let stored = secrets::read(WEBDAV_KEY).is_some();
         Self {
             url: line("https://dav.example.com/myuri", &settings.webdav_url, false),
             user: line("用户名", &settings.webdav_user, false),
@@ -156,9 +175,9 @@ impl SyncView {
             fs::write(self.dir.join(config::SETTINGS_FILE), updated).map_err(|error| error.to_string())?;
         }
         if !typed.is_empty() {
-            secrets::write(WEBDAV_SECRET, &typed)?;
+            secrets::write(WEBDAV_KEY, &typed)?;
         }
-        let password = if typed.is_empty() { secrets::read(WEBDAV_SECRET).unwrap_or_default() } else { typed };
+        let password = if typed.is_empty() { secrets::read(WEBDAV_KEY).unwrap_or_default() } else { typed };
         let address = format!("{}/{}", url.trim_end_matches('/'), backup::REMOTE_NAME);
         Ok((address, basic(&user, &password)))
     }
@@ -190,6 +209,9 @@ impl SyncView {
     }
 
     fn export(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
         let recipe = match self.recipe(cx) {
             Ok(recipe) => recipe,
             Err(reason) => return self.report(Err(reason), cx),
@@ -199,6 +221,9 @@ impl SyncView {
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = chosen.await else { return };
             let _ = this.update(cx, |this, cx| {
+                if this.busy {
+                    return;
+                }
                 this.run(
                     false,
                     move || {
@@ -214,6 +239,9 @@ impl SyncView {
     }
 
     fn import(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
         let lock = self.read(&self.lock, cx);
         let dir = self.dir.clone();
         let chosen = cx.prompt_for_paths(PathPromptOptions {
@@ -226,6 +254,9 @@ impl SyncView {
             let Ok(Ok(Some(paths))) = chosen.await else { return };
             let Some(path) = paths.into_iter().next() else { return };
             let _ = this.update(cx, |this, cx| {
+                if this.busy {
+                    return;
+                }
                 this.run(
                     true,
                     move || {
@@ -240,6 +271,9 @@ impl SyncView {
     }
 
     fn upload(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
         let prepared = self.recipe(cx).and_then(|recipe| self.remote(cx).map(|remote| (recipe, remote)));
         let (recipe, (address, headers)) = match prepared {
             Ok(prepared) => prepared,
@@ -257,6 +291,9 @@ impl SyncView {
     }
 
     fn download(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
         let (address, headers) = match self.remote(cx) {
             Ok(remote) => remote,
             Err(reason) => return self.report(Err(reason), cx),

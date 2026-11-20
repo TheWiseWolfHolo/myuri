@@ -7,10 +7,12 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
-    GetClipboardFormatNameW, GetClipboardSequenceNumber, OpenClipboard,
-    RegisterClipboardFormatW, SetClipboardData,
+    GetClipboardFormatNameW, GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
+    SetClipboardData,
 };
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::core::PCWSTR;
 
 use crate::capture::{Content, Image, ImageFormat};
@@ -88,21 +90,40 @@ impl Open {
     }
 
     fn set(&self, format: u32, bytes: &[u8]) -> bool {
+        GlobalBytes::new(bytes).is_some_and(|memory| self.place(format, memory))
+    }
+
+    fn place(&self, format: u32, memory: GlobalBytes) -> bool {
+        let placed = unsafe { SetClipboardData(format, HANDLE(memory.0.0)).is_ok() };
+        if placed {
+            // The system owns the memory after a successful transfer.
+            std::mem::forget(memory);
+        }
+        placed
+    }
+}
+
+struct GlobalBytes(HGLOBAL);
+
+impl GlobalBytes {
+    fn new(bytes: &[u8]) -> Option<Self> {
         unsafe {
-            let Ok(memory) = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) else { return false };
-            let pointer = GlobalLock(memory);
+            let memory = Self(GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)).ok()?);
+            let pointer = GlobalLock(memory.0);
             if pointer.is_null() {
-                let _ = GlobalFree(memory);
-                return false;
+                return None;
             }
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast::<u8>(), bytes.len());
-            let _ = GlobalUnlock(memory);
-            // On success the system owns the memory.
-            let placed = SetClipboardData(format, HANDLE(memory.0)).is_ok();
-            if !placed {
-                let _ = GlobalFree(memory);
-            }
-            placed
+            let _ = GlobalUnlock(memory.0);
+            Some(memory)
+        }
+    }
+}
+
+impl Drop for GlobalBytes {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = GlobalFree(self.0);
         }
     }
 }
@@ -115,25 +136,38 @@ impl Drop for Open {
     }
 }
 
-/// Put a picture on the clipboard, as the registered PNG format plus a DIB
-/// when the bytes decode (so older programs can paste it too).
+/// Put a picture on the clipboard as a DIB and, when available, as PNG.
 pub fn write_image(owner: HWND, bytes: &[u8]) -> bool {
-    let Some(clipboard) = Open::new(owner) else { return false };
-    unsafe { let _ = EmptyClipboard(); }
-    let mut placed = false;
-    if bytes.starts_with(b"\x89PNG") {
-        placed |= clipboard.set(format_id("PNG"), bytes);
-    }
+    let Ok(bitmap) = ::image::load_from_memory(bytes) else {
+        return false;
+    };
+    let mut bmp = std::io::Cursor::new(Vec::new());
     // A DIB is a BMP file without its 14-byte header.
-    if let Ok(bitmap) = ::image::load_from_memory(bytes) {
-        let mut bmp = std::io::Cursor::new(Vec::new());
-        if bitmap.write_to(&mut bmp, ::image::ImageFormat::Bmp).is_ok() {
-            let bmp = bmp.into_inner();
-            if bmp.len() > 14 {
-                placed |= clipboard.set(CF_DIB, &bmp[14..]);
-            }
-        }
+    if bitmap
+        .write_to(&mut bmp, ::image::ImageFormat::Bmp)
+        .is_err()
+    {
+        return false;
     }
+    let Some(dib) = GlobalBytes::new(&bmp.get_ref()[14..]) else {
+        return false;
+    };
+    let png = if bytes.starts_with(b"\x89PNG") {
+        let Some(png) = GlobalBytes::new(bytes) else {
+            return false;
+        };
+        Some(png)
+    } else {
+        None
+    };
+    let Some(clipboard) = Open::new(owner) else {
+        return false;
+    };
+    if unsafe { EmptyClipboard() }.is_err() {
+        return false;
+    }
+    let placed = png.is_some_and(|png| clipboard.place(format_id("PNG"), png));
+    let placed = clipboard.place(CF_DIB, dib) || placed;
     placed
 }
 
@@ -174,38 +208,69 @@ fn skipped(format: u32, name: &str) -> bool {
 pub fn snapshot(owner: HWND) -> Option<Snapshot> {
     let started = Instant::now();
     let clipboard = Open::new(owner)?;
+    let mut offered = clipboard.formats();
+    offered.retain(|&format| {
+        !skipped(
+            format,
+            &if format >= 0xC000 {
+                format_name(format)
+            } else {
+                String::new()
+            },
+        )
+    });
+    snapshot_formats(offered, started, |format| clipboard.bytes(format))
+}
+
+fn snapshot_formats(
+    offered: Vec<u32>,
+    started: Instant,
+    mut copy: impl FnMut(u32) -> Option<Vec<u8>>,
+) -> Option<Snapshot> {
+    let mut ordered: Vec<_> = offered.into_iter().enumerate().collect();
+    // Read the lossless variants first. The enumeration also contains sibling
+    // formats supplied explicitly by the owner, so keep those bytes too.
+    ordered.sort_by_key(|&(_, format)| !matches!(format, CF_UNICODETEXT | CF_DIBV5));
     let mut formats = Vec::new();
     let mut total = 0;
-    // Windows derives the other text and bitmap flavors from the first one,
-    // so one member of each family is enough.
-    let (mut text, mut bitmap) = (false, false);
-    for format in clipboard.formats() {
+    let mut missing_family = [false; 2];
+    let mut saved_family = [false; 2];
+    for (position, format) in ordered {
         let family = match format {
-            CF_TEXT | CF_OEMTEXT | CF_UNICODETEXT => Some(&mut text),
-            CF_DIB | CF_DIBV5 => Some(&mut bitmap),
+            CF_TEXT | CF_OEMTEXT | CF_UNICODETEXT => Some(0),
+            CF_DIB | CF_DIBV5 => Some(1),
             _ => None,
         };
-        if let Some(seen) = family {
-            if std::mem::replace(seen, true) {
-                continue;
-            }
-        } else if skipped(format, &if format >= 0xC000 { format_name(format) } else { String::new() }) {
+        let Some(bytes) = copy(format) else {
+            let family = family?;
+            missing_family[family] = true;
             continue;
+        };
+        if let Some(family) = family {
+            saved_family[family] = true;
         }
-        let Some(bytes) = clipboard.bytes(format) else { continue };
         total += bytes.len();
         if total > SNAPSHOT_BYTES || started.elapsed() > SNAPSHOT_TIME {
             return None;
         }
-        formats.push((format, bytes));
+        formats.push((position, format, bytes));
     }
-    Some(Snapshot { formats })
+    if missing_family.into_iter().zip(saved_family).any(|(missing, saved)| missing && !saved)
+        || started.elapsed() > SNAPSHOT_TIME
+    {
+        return None;
+    }
+    // Keep the owner's format preference when restoring the data.
+    formats.sort_by_key(|&(position, _, _)| position);
+    Some(Snapshot { formats: formats.into_iter().map(|(_, format, bytes)| (format, bytes)).collect() })
 }
 
 /// Replace the clipboard with a snapshot.
 pub fn restore(owner: HWND, snapshot: &Snapshot) -> bool {
     // SetClipboardData fails without an owning window.
-    let Some(clipboard) = Open::new(owner) else { return false };
+    let Some(clipboard) = Open::new(owner) else {
+        return false;
+    };
     if unsafe { EmptyClipboard() }.is_err() {
         return false;
     }
@@ -215,7 +280,10 @@ pub fn restore(owner: HWND, snapshot: &Snapshot) -> bool {
     }
     // The original copy is already in the clipboard history; keep this
     // restore from adding a duplicate or syncing to other devices.
-    clipboard.set(format_id("ExcludeClipboardContentFromMonitorProcessing"), &[0]);
+    clipboard.set(
+        format_id("ExcludeClipboardContentFromMonitorProcessing"),
+        &0u32.to_le_bytes(),
+    );
     complete
 }
 
@@ -231,30 +299,62 @@ pub fn read(owner: HWND, fresh_copy: bool) -> Option<Content> {
     let has = |format: u32| formats.contains(&format);
 
     if has(CF_HDROP) {
-        let files = clipboard.bytes(CF_HDROP).map(|bytes| parse_file_list(&bytes)).unwrap_or_default();
+        let files = clipboard
+            .bytes(CF_HDROP)
+            .map(|bytes| parse_file_list(&bytes))
+            .unwrap_or_default();
         if !files.is_empty() {
             return Some(Content::Files(files));
         }
     }
     if has(CF_UNICODETEXT) {
-        let text = clipboard.bytes(CF_UNICODETEXT).map(|bytes| decode_utf16(&bytes)).unwrap_or_default();
+        let text = clipboard
+            .bytes(CF_UNICODETEXT)
+            .map(|bytes| decode_utf16(&bytes))
+            .unwrap_or_default();
         if !text.trim().is_empty() {
             let custom = format_id("Chromium Web Custom MIME Data Format");
-            if fresh_copy && has(custom) && clipboard.bytes(custom).is_some_and(|b| is_empty_selection_copy(&b)) {
+            if fresh_copy
+                && has(custom)
+                && clipboard
+                    .bytes(custom)
+                    .is_some_and(|b| is_empty_selection_copy(&b))
+            {
                 return None;
             }
             return Some(Content::Text(text));
         }
     }
+    let image = read_open_image(&clipboard, &formats)?;
+    drop(clipboard);
+    Some(Content::Image(image.into_png()))
+}
+
+/// Read the clipboard's image, even when the owner also exposes text.
+pub fn read_image(owner: HWND) -> Option<Image> {
+    let clipboard = Open::new(owner)?;
+    let image = read_open_image(&clipboard, &clipboard.formats())?;
+    drop(clipboard);
+    Some(image.into_png())
+}
+
+fn read_open_image(clipboard: &Open, formats: &[u32]) -> Option<Image> {
+    let has = |format| formats.contains(&format);
     let png = format_id("PNG");
     if has(png) {
         if let Some(bytes) = clipboard.bytes(png).filter(|b| !b.is_empty()) {
-            return Some(Content::Image(Image { format: ImageFormat::Png, bytes }));
+            return Some(Image {
+                format: ImageFormat::Png,
+                bytes,
+            });
         }
     }
     if has(CF_DIB) || has(CF_DIBV5) || has(CF_BITMAP) {
         if let Some(bytes) = clipboard.bytes(CF_DIB).filter(|b| !b.is_empty()) {
-            return Some(Content::Image(Image { format: ImageFormat::Dib, bytes }.into_png()));
+            return Some(Image {
+                format: ImageFormat::Dib,
+                bytes,
+            });
         }
     }
     None
@@ -278,10 +378,14 @@ fn parse_file_list(bytes: &[u8]) -> Vec<PathBuf> {
     }
     let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let wide = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) != 0;
-    let Some(list) = bytes.get(offset..) else { return Vec::new() };
+    let Some(list) = bytes.get(offset..) else {
+        return Vec::new();
+    };
     if wide {
-        let units: Vec<u16> =
-            list.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        let units: Vec<u16> = list
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
         units
             .split(|&unit| unit == 0)
             .take_while(|path| !path.is_empty())
@@ -306,6 +410,32 @@ fn is_empty_selection_copy(custom_data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_reads_richer_formats_first_and_keeps_each_representation() {
+        const CUSTOM: u32 = 0xC000;
+        let offered = vec![CUSTOM, CF_TEXT, CF_DIB, CF_UNICODETEXT, CF_DIBV5];
+        let mut read = Vec::new();
+        let saved = snapshot_formats(offered.clone(), Instant::now(), |format| {
+            read.push(format);
+            Some(format.to_le_bytes().to_vec())
+        }).unwrap();
+        assert_eq!(read, [CF_UNICODETEXT, CF_DIBV5, CUSTOM, CF_TEXT, CF_DIB]);
+        let expected: Vec<_> = offered.into_iter().map(|format| (format, format.to_le_bytes().to_vec())).collect();
+        assert_eq!(saved.formats, expected);
+    }
+
+    #[test]
+    fn snapshot_uses_family_fallbacks_and_rejects_missing_unrelated_data() {
+        let saved = snapshot_formats(vec![CF_UNICODETEXT, CF_TEXT, CF_DIBV5, CF_DIB], Instant::now(), |format| {
+            matches!(format, CF_TEXT | CF_DIB).then(|| vec![1, 2, 3, 4])
+        }).unwrap();
+        assert_eq!(saved.formats.iter().map(|(format, _)| *format).collect::<Vec<_>>(), [CF_TEXT, CF_DIB]);
+        assert!(snapshot_formats(vec![CF_UNICODETEXT], Instant::now(), |_| None).is_none());
+        assert!(snapshot_formats(vec![CF_UNICODETEXT, CF_HDROP], Instant::now(), |format| {
+            (format == CF_UNICODETEXT).then(|| utf16("测试"))
+        }).is_none());
+    }
 
     fn utf16(text: &str) -> Vec<u8> {
         text.encode_utf16().flat_map(u16::to_le_bytes).collect()
@@ -343,8 +473,12 @@ mod tests {
 
     #[test]
     fn empty_selection_copies_are_recognized() {
-        let line_copy = utf16("vscode-editor-data{\"version\":1,\"isFromEmptySelection\":true,\"mode\":\"rust\"}");
-        let real_copy = utf16("vscode-editor-data{\"version\":1,\"isFromEmptySelection\":false,\"mode\":\"rust\"}");
+        let line_copy = utf16(
+            "vscode-editor-data{\"version\":1,\"isFromEmptySelection\":true,\"mode\":\"rust\"}",
+        );
+        let real_copy = utf16(
+            "vscode-editor-data{\"version\":1,\"isFromEmptySelection\":false,\"mode\":\"rust\"}",
+        );
         assert!(is_empty_selection_copy(&line_copy));
         assert!(!is_empty_selection_copy(&real_copy));
         assert!(!is_empty_selection_copy(&[]));

@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use gpui_kit::{AnyElement, Image, ImageFormat, IntoElement, ParentElement, Rgba, Styled, div, img, px};
 
 use myuri_core::brand::Brands;
-use myuri_core::config::Provider;
+use myuri_core::config::{ImageProvider, Provider, SpeechProvider};
 
 use crate::net;
 
@@ -144,11 +144,10 @@ fn model_source(name: &str) -> Option<Source> {
 /// A provider's `icon` may be left out (matched from its id, name and
 /// address), name an icon of the set, point at a picture in the
 /// configuration folder, or be a web address.
-fn provider_source(provider: &Provider) -> Option<Source> {
-    let written = provider.icon.trim();
+fn provider_source(id: &str, name: &str, base_url: &str, icon: &str) -> Option<Source> {
+    let written = icon.trim();
     if written.is_empty() {
-        let name = if provider.name.is_empty() { &provider.id } else { &provider.name };
-        return BRANDS.provider(&provider.id, name, &provider.base_url).map(|brand| Source::Lobe(brand.file()));
+        return BRANDS.provider(id, name, base_url).map(|brand| Source::Lobe(brand.file()));
     }
     if written.starts_with("http://") || written.starts_with("https://") {
         return Some(Source::Web(written.to_string()));
@@ -174,8 +173,8 @@ pub fn model(name: &str, ink: Rgba) -> Option<Arc<Image>> {
     picture(&model_source(name)?, ink)
 }
 
-pub fn provider(provider: &Provider, ink: Rgba) -> Option<Arc<Image>> {
-    picture(&provider_source(provider)?, ink)
+pub fn provider_details(id: &str, name: &str, base_url: &str, icon: &str, ink: Rgba) -> Option<Arc<Image>> {
+    picture(&provider_source(id, name, base_url, icon)?, ink)
 }
 
 /// The picture in a square of `size`.
@@ -205,18 +204,26 @@ pub fn avatar(image: Option<Arc<Image>>, name: &str, size: f32, tile: Rgba, ink:
 
 /// Download every icon the providers and their models use, off the UI
 /// thread, so lists show them from the first time they open.
-pub fn prefetch(providers: &[Provider]) {
-    let providers = providers.to_vec();
+pub fn prefetch(chat: Vec<Provider>, images: Vec<ImageProvider>, speech: Vec<SpeechProvider>) {
     std::thread::spawn(move || {
         let mut seen = HashSet::new();
-        for provider in &providers {
-            let models = provider.models.iter().chain(&provider.image_models);
-            let sources = provider_source(provider).into_iter().chain(models.filter_map(|name| model_source(name)));
-            for source in sources {
-                if seen.insert(source.path()) {
-                    source.download();
-                }
+        let mut get = |source: Source| {
+            if seen.insert(source.path()) {
+                source.download();
             }
+        };
+        for p in chat {
+            provider_source(&p.id, &p.name, &p.base_url, &p.icon).into_iter()
+                .chain(p.models.iter().filter_map(|name| model_source(name))).for_each(&mut get);
+        }
+        for p in images {
+            provider_source(&p.id, &p.name, &p.base_url, &p.icon).into_iter()
+                .chain(p.models.iter().filter_map(|name| model_source(name))).for_each(&mut get);
+        }
+        for p in speech {
+            provider_source(&p.id, &p.name, &p.base_url, &p.icon).into_iter()
+                .chain(p.asr_models.iter().chain(&p.tts_models).filter_map(|name| model_source(name)))
+                .for_each(&mut get);
         }
     });
 }

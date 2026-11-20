@@ -21,10 +21,15 @@ to capture the selection and pick an assistant from a panel at the cursor.
 
 ```sh
 cargo test -p myuri-core    # seconds; no GPUI build
-cargo test                  # everything
+cargo test --workspace      # everything
+cargo check --workspace     # compile-check the workspace
 cargo build                 # target/debug/myuri.exe
+cargo build --release       # target/release/myuri.exe
 myuri check                 # validate the configuration files
+myuri --version             # show the Cargo version
 myuri preview [text|image|files]   # show the panel in the running instance
+myuri key [--image|--speech] <id> [--delete]
+myuri image <id> <model> <prompt> [--resolution 1K|2K|4K] [--ref <image>]...
 myuri quit
 ```
 
@@ -40,10 +45,23 @@ at the mouse; say so instead of claiming they were verified.
   Firefox windows. Both rules live in `capture.rs` with their reasons.
 - The clipboard is restored exactly or not touched at all.
 - Logs never contain captured content, only kinds and sizes.
-- Configuration is `%APPDATA%\Myuri\config.toml` and `assistants.toml`. Unknown
-  keys and out-of-range values are errors. Files reload on save. When changing
-  the schema, update `DEFAULT_SETTINGS` / `DEFAULT_ASSISTANTS` with it; a test
-  keeps them equal to the code.
+- Configuration in `%APPDATA%\Myuri` includes `config.toml` and
+  `assistants.toml`. Unknown keys and out-of-range values are errors. Files
+  reload on save. Update the corresponding `DEFAULT_*` template when changing
+  its schema and keep the default-equality tests passing.
+- Each channel type has its own file and Windows credential target prefix.
+
+  | Type | File | Credential target |
+  | --- | --- | --- |
+  | Chat | `providers.toml` | `Myuri/provider/<id>` |
+  | Image | `image_providers.toml` | `Myuri/image/<id>` |
+  | Speech | `speech_providers.toml` | `Myuri/speech/<id>` |
+
+  The files can use the same IDs. Startup fills missing image and speech files
+  from the legacy `providers.toml` and copies each corresponding chat secret
+  when its target is empty. Verify migration with synthetic data in a temporary
+  directory. Use fixture credentials and avoid reading or editing the real
+  configuration during development.
 - Log: `%LOCALAPPDATA%\Myuri\logs\myuri.log`. `[log] debug = true` adds timings.
 - GPUI comes through `gpui-kit 0.10.0`, which pins `gpui-pre =0.3.12`; the
   `windows` crate stays at 0.58 to match it. Dev builds use `opt-level = 1`
@@ -54,11 +72,11 @@ at the mouse; say so instead of claiming they were verified.
 - Done: gesture, capture, panel, tray, CLI, config hot reload, app icon
   (`tools/make-icon.py`), provider routing (`chat.rs`), streaming over WinHTTP
   (`net.rs`), four chat APIs in `myuri-core/src/llm.rs`, keys in the Windows
-  credential store (`myuri key <id>`), the assistant window (`window.rs`:
+  credential store (`myuri key`), the assistant window (`window.rs`:
   frameless, streaming Markdown, follow-up, stop, copy, retry, model and
   reasoning switch), the model catalog (`myuri-core/src/catalog.rs`, data from
-  models.dev, built-in copy in `assets/models.json`, `myuri models refresh`).
-- The user's real data is in `%APPDATA%\Myuri`; never print keys.
+  models.dev, built-in copy in `assets/models.json`, `myuri models refresh`,
+  and vendor model selection in `settings/catalog_form.rs`).
 - Also done: per-provider model fetch (`myuri models fetch`), several keys
   per provider with notes and strategies, Vertex service-account sign-in
   (`vertex.rs`), picture generation for OpenAI, xAI, Gemini, EvoLink and
@@ -66,15 +84,18 @@ at the mouse; say so instead of claiming they were verified.
   tray menu drawn in GPUI (`traymenu.rs`), and the settings window
   (`settings.rs`: assistants, chat, pictures, speech, general; create, rename,
   delete, drag to reorder, search). Tray left click opens settings.
-- A provider serves chat, pictures (`image_models`, `image_api`) and/or speech
-  (`speech_api`, `asr_models`, `tts_models`); `Provider::serves` decides which
-  settings page lists it. Settings edits go through `myuri-core/src/edit.rs`
-  (toml_edit, comments kept; reordering must reset table positions).
-- Also done: pictures and speech in the assistant window (`speech.rs` in both
-  crates), the model's thinking shown above its reply, a shared model picker
-  (`picker.rs`), `ui-state.toml` for window state, and brand icons
-  (`myuri-core/src/brand.rs` rules, `myuri/src/brand.rs` download and cache;
-  `tools/lobehub-map.py` regenerates `assets/lobehub.json`).
+- `Provider`, `ImageProvider` and `SpeechProvider` describe the three channel
+  types. `PickerEvent::Chosen` carries a `Purpose` together with its model
+  reference. Legacy fields on `Provider` are parsed for migration. Settings
+  edits go through `myuri-core/src/edit.rs` (toml_edit preserves comments).
+  Reordering must reset table positions.
+- The assistant window uses `ImageSpec` for generation and reference image
+  editing. It also supports direct speech synthesis, WAV and MP3 audio cards,
+  and saving or reading chat replies aloud. Speech protocol and playback live
+  in `speech.rs` in the respective crates. The model's thinking is shown above
+  its reply. `ui-state.toml` stores window state. Brand icons use
+  `myuri-core/src/brand.rs` for matching and `myuri/src/brand.rs` for downloads
+  and caching. `tools/lobehub-map.py` regenerates `assets/lobehub.json`.
 - Also done: saved conversations (`myuri-core/src/history.rs`, the history
   page `historyview.rs`, resume through `UiMsg::Resume`), backup to a file or
   WebDAV with keys sealed by a password (`myuri-core/src/backup.rs`,
@@ -92,13 +113,15 @@ at the mouse; say so instead of claiming they were verified.
   and fake servers on localhost for providers, MCP and WebDAV.
 - The repository is public at github.com/TheWiseWolfHolo/myuri. Nothing
   personal goes into commits: no provider names, keys, paths or screenshots of
-  the user's own setup. CI runs on every push; pushing a tag `vX.Y.Z` that
-  matches the workspace version builds and publishes a release. The branch
+  the user's own setup. CI runs on every push. The manual Release workflow
+  runs tests and uploads the Windows ZIP as an Actions artifact. A tag push
+  matching the workspace version publishes a release. The branch
   `local-history` holds the pre-publication history and is never pushed.
 - Only chat completions has been exercised against a real endpoint. Responses,
   Anthropic and Gemini have unit tests only.
-- `dist/myuri.exe` is the copy the user runs day to day. Rebuild into
-  `target/` freely; copy to `dist/` only after `myuri quit`, then restart it.
+- The user runs an installed release binary outside the repository (not
+  `dist/myuri.exe`). Rebuild into `target/` freely; replace the installed
+  binary only after `myuri quit`, then restart it.
 - `tools/ui-probe.ps1` posts keys and clicks to Myuri's own windows and saves
   screenshots to `target/`; `-Drag x1,y1,x2,y2` drags. Coordinates are
   physical pixels. It pops windows up on the user's screen: say so before

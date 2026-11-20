@@ -9,6 +9,7 @@ pub enum Field {
     Text(String),
     Flag(bool),
     Number(i64),
+    Float(f64),
     /// A list written one item per line. Empty removes the key.
     List(Vec<String>),
     /// An array of inline tables, one row per entry, e.g.
@@ -32,6 +33,19 @@ impl Field {
             Self::Text(text) => Some(value(text.as_str())),
             Self::Flag(flag) => Some(value(*flag)),
             Self::Number(number) => Some(value(*number)),
+            Self::Float(number) => {
+                if !number.is_finite() {
+                    return Some(value(*number));
+                }
+                let rounded = format!("{number:.3}");
+                let stripped = rounded.trim_end_matches('0');
+                let text = if stripped.ends_with('.') {
+                    format!("{stripped}0")
+                } else {
+                    stripped.to_string()
+                };
+                Some(Item::Value(text.parse().expect("formatted TOML float")))
+            }
             Self::List(items) if items.is_empty() => None,
             Self::List(items) => {
                 let mut array = toml_edit::Array::new();
@@ -56,10 +70,8 @@ impl Field {
                 for row in rows {
                     let mut table = toml_edit::InlineTable::new();
                     for (key, field) in row {
-                        if let Some(item) = field.item() {
-                            if let Some(value) = item.as_value() {
-                                table.insert(*key, value.clone());
-                            }
+                        if let Some(value) = field.item().and_then(|item| item.as_value().cloned()) {
+                            table.insert(*key, value);
                         }
                     }
                     array.push_formatted(
@@ -145,9 +157,28 @@ pub fn reorder(source: &str, array: &str, order: &[usize]) -> Result<String, Str
     for (slot, &index) in slots.into_iter().zip(order) {
         let mut table = all[index].clone();
         table.set_position(slot);
+        clear_nested_positions(&mut table);
         tables.push(table);
     }
     Ok(document.to_string())
+}
+
+fn clear_nested_positions(table: &mut toml_edit::Table) {
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Table(sub) => {
+                sub.set_position(None);
+                clear_nested_positions(sub);
+            }
+            Item::ArrayOfTables(array) => {
+                for sub in array.iter_mut() {
+                    sub.set_position(None);
+                    clear_nested_positions(sub);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Remove the `[[array]]` entry whose `id_key` is `id`.
@@ -192,25 +223,7 @@ pub fn rename_provider(
     let prefix = format!("{old}/");
     let retarget = |text: &str| text.strip_prefix(&prefix).map(|rest| format!("{new}/{rest}"));
 
-    let mut providers = parse(providers)?;
-    let table = providers
-        .get_mut("provider")
-        .and_then(Item::as_array_of_tables_mut)
-        .and_then(|tables| {
-            tables.iter_mut().find(|table| table.get("id").and_then(Item::as_str) == Some(old))
-        })
-        .ok_or_else(|| format!("文件里没有 id 是 \"{old}\" 的 [[provider]]"))?;
-    put(table, "id", &Field::Text(new.to_string()));
-    if let Some(favorites) = providers.get_mut("favorites").and_then(Item::as_array_mut) {
-        for entry in favorites.iter_mut() {
-            if let Some(next) = entry.as_str().and_then(&retarget) {
-                let decor = entry.decor().clone();
-                let mut value = toml_edit::Value::from(next);
-                *value.decor_mut() = decor;
-                *entry = value;
-            }
-        }
-    }
+    let providers = rename_provider_with_favorites(providers, old, new)?;
 
     let mut assistants = parse(assistants)?;
     if let Some(tables) = assistants.get_mut("assistant").and_then(Item::as_array_of_tables_mut) {
@@ -230,7 +243,112 @@ pub fn rename_provider(
             }
         }
     }
-    Ok((providers.to_string(), assistants.to_string(), settings.to_string()))
+    Ok((providers, assistants.to_string(), settings.to_string()))
+}
+
+pub fn rename_image_provider(
+    providers: &str,
+    settings: &str,
+    old: &str,
+    new: &str,
+) -> Result<(String, String), String> {
+    let providers = rename_provider_with_favorites(providers, old, new)?;
+    let mut settings = parse(settings)?;
+    let prefix = format!("{old}/");
+    if let Some(image) = settings.get_mut("image").and_then(Item::as_table_like_mut)
+        && let Some(next) = image
+            .get("default")
+            .and_then(Item::as_str)
+            .and_then(|text| text.strip_prefix(&prefix))
+            .map(|rest| format!("{new}/{rest}"))
+    {
+        put(image, "default", &Field::Text(next));
+    }
+    Ok((providers, settings.to_string()))
+}
+
+/// Add or remove `reference` in the top-level `favorites` array of a provider file.
+/// Returns the updated TOML text and whether `reference` is now favorited.
+pub fn toggle_favorite(source: &str, reference: &str) -> Result<(String, bool), String> {
+    let mut document = parse(source)?;
+    let mut list: Vec<String> = document
+        .get("favorites")
+        .and_then(Item::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let added = if let Some(position) = list.iter().position(|existing| existing == reference) {
+        list.remove(position);
+        false
+    } else {
+        list.push(reference.to_string());
+        true
+    };
+    if list.is_empty() {
+        document.as_table_mut().remove("favorites");
+    } else {
+        let mut array = toml_edit::Array::new();
+        for item in &list {
+            array.push(item.as_str());
+        }
+        document.as_table_mut().insert("favorites", value(array));
+    }
+    Ok((document.to_string(), added))
+}
+
+fn rename_provider_with_favorites(providers: &str, old: &str, new: &str) -> Result<String, String> {
+    let mut document = parse(providers)?;
+    rename_provider_entry(&mut document, old, new)?;
+    let prefix = format!("{old}/");
+    if let Some(favorites) = document.get_mut("favorites").and_then(Item::as_array_mut) {
+        for entry in favorites.iter_mut() {
+            if let Some(rest) = entry.as_str().and_then(|text| text.strip_prefix(&prefix)) {
+                let decor = entry.decor().clone();
+                let mut value = toml_edit::Value::from(format!("{new}/{rest}"));
+                *value.decor_mut() = decor;
+                *entry = value;
+            }
+        }
+    }
+    Ok(document.to_string())
+}
+
+pub fn rename_speech_provider(
+    providers: &str,
+    settings: &str,
+    old: &str,
+    new: &str,
+) -> Result<(String, String), String> {
+    let mut document = parse(providers)?;
+    rename_provider_entry(&mut document, old, new)?;
+    let mut settings = parse(settings)?;
+    let prefix = format!("{old}/");
+    if let Some(speech) = settings.get_mut("speech").and_then(Item::as_table_like_mut) {
+        for key in ["asr", "tts"] {
+            let next = speech.get(key).and_then(Item::as_str).and_then(|text| text.strip_prefix(&prefix))
+                .map(|rest| format!("{new}/{rest}"));
+            if let Some(next) = next {
+                put(speech, key, &Field::Text(next));
+            }
+        }
+    }
+    Ok((document.to_string(), settings.to_string()))
+}
+
+fn rename_provider_entry(document: &mut DocumentMut, old: &str, new: &str) -> Result<(), String> {
+    let table = document
+        .get_mut("provider")
+        .and_then(Item::as_array_of_tables_mut)
+        .and_then(|tables| {
+            tables.iter_mut().find(|table| table.get("id").and_then(Item::as_str) == Some(old))
+        })
+        .ok_or_else(|| format!("文件里没有 id 是 \"{old}\" 的 [[provider]]"))?;
+    put(table, "id", &Field::Text(new.to_string()));
+    Ok(())
 }
 
 /// Change `key` in `[table]`, creating the table when it is missing.
@@ -250,6 +368,47 @@ pub fn set_setting(source: &str, table: &str, key: &str, field: Field) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_split_routes_preserves_unrelated_references() {
+        let provider = "[[provider]]\nid = \"old\"\nbase_url = \"https://example.test\"\n";
+        let image = format!("favorites = [\"old/org/image\", \"older/image\"]\n{provider}");
+        let settings = "[models]\ndefault = \"old/chat\"\n[image]\ndefault = \"old/org/image\"\n[speech]\nasr = \"old/asr\"\ntts = \"older/tts\"\n";
+        let (edited, settings) = rename_image_provider(&image, settings, "old", "new").unwrap();
+        assert!(edited.contains("\"new/org/image\"") && edited.contains("\"older/image\""));
+        assert!(settings.contains("[image]\ndefault = \"new/org/image\""));
+        assert!(settings.contains("[models]\ndefault = \"old/chat\""));
+        assert!(settings.contains("asr = \"old/asr\""));
+        let (edited, settings) = rename_speech_provider(provider, &settings, "old", "new").unwrap();
+        let edited = set_entry(&edited, "provider", "id", "new", &[
+            ("speed", Field::Float(1.15)),
+            ("style", Field::Float(0.0)),
+            ("stability", Field::Float(0.34567)),
+        ]).unwrap();
+        assert!(edited.contains("speed = 1.15\n"));
+        assert!(edited.contains("style = 0.0\n"));
+        assert!(edited.contains("stability = 0.346\n"));
+        let channels = crate::config::parse_speech_providers(&edited).unwrap();
+        assert_eq!(channels[0].id, "new");
+        assert!(settings.contains("asr = \"new/asr\""));
+        assert!(settings.contains("tts = \"older/tts\""));
+        assert!(settings.contains("[models]\ndefault = \"old/chat\""));
+    }
+
+    #[test]
+    fn toggle_favorite_inserts_before_providers_and_clears_when_empty() {
+        let source = "# header\n\n[[provider]]\nid = \"p1\"\nbase_url = \"https://example.test\"\nmodels = [\"m1\"]\n";
+        let (added, now_fav) = toggle_favorite(source, "p1/m1").unwrap();
+        assert!(now_fav);
+        assert!(added.contains("# header"));
+        assert_eq!(crate::config::parse_providers(&added).unwrap()[0].id, "p1");
+        let parsed: toml::Value = toml::from_str(&added).unwrap();
+        assert_eq!(parsed["favorites"].as_array().unwrap()[0].as_str(), Some("p1/m1"));
+        let (removed, now_fav) = toggle_favorite(&added, "p1/m1").unwrap();
+        assert!(!now_fav);
+        assert!(!removed.contains("favorites"));
+        assert_eq!(crate::config::parse_providers(&removed).unwrap()[0].id, "p1");
+    }
     use crate::config::{parse_assistants, parse_settings};
 
     const ASSISTANTS: &str = "# mine\n[[assistant]]\nname = \"翻译\" # keep\nicon = \"译\"\n\n[[assistant]]\nname = \"润色\"\nmodel = \"a/b\"\n";
@@ -358,5 +517,38 @@ mod tests {
         assert_eq!(servers[0].env["B C"], "2");
         let cleared = set_entry(&changed, "server", "name", "a", &[("env", Field::Map(Vec::new()))]).unwrap();
         assert!(!cleared.contains("env"));
+    }
+
+    #[test]
+    fn reorder_keeps_nested_subtables_with_their_parent() {
+        let source = "\
+[[provider]]
+id = \"first\"
+base_url = \"https://first.invalid\"
+
+[provider.headers]
+X-Owner = \"first\"
+
+[[provider.keys]]
+note = \"k1\"
+
+[[provider]]
+id = \"second\"
+base_url = \"https://second.invalid\"
+
+[provider.headers]
+X-Owner = \"second\"
+
+[[provider.keys]]
+note = \"k2\"
+";
+        let moved = reorder(source, "provider", &[1, 0]).unwrap();
+        let providers = crate::config::parse_image_providers(&moved).unwrap();
+        assert_eq!(providers[0].id, "second");
+        assert_eq!(providers[0].headers.get("X-Owner").map(String::as_str), Some("second"));
+        assert_eq!(providers[0].keys[0].note, "k2");
+        assert_eq!(providers[1].id, "first");
+        assert_eq!(providers[1].headers.get("X-Owner").map(String::as_str), Some("first"));
+        assert_eq!(providers[1].keys[0].note, "k1");
     }
 }

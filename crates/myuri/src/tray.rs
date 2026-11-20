@@ -14,10 +14,12 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos,
-    GetMessageW, GetSystemMetrics, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,     MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON,
-    SW_SHOWNORMAL, SetForegroundWindow,     WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,     WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
+    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
+    GetWindowThreadProcessId, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON,
+    SW_SHOWNORMAL, SetForegroundWindow, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCSTR, PCWSTR, w};
 
@@ -186,6 +188,13 @@ pub fn send_to_running_instance(request: Request) -> bool {
     unsafe {
         match FindWindowW(WINDOW_CLASS, PCWSTR::null()) {
             Ok(window) if !window.0.is_null() => {
+                if wparam == CONTROL_SETTINGS {
+                    let mut process = 0;
+                    GetWindowThreadProcessId(window, Some(&mut process));
+                    if process != 0 {
+                        let _ = AllowSetForegroundWindow(process);
+                    }
+                }
                 PostMessageW(window, WM_CONTROL, WPARAM(wparam), LPARAM(lparam)).is_ok()
             }
             _ => false,
@@ -237,7 +246,9 @@ unsafe extern "system" fn window_proc(
                     match command {
                         Command::Notify(text) => tray.notify(&text),
                         Command::Menu(entry) => {
-                            on_menu(entry, &tray.paused, &tray.ui);
+                            if let Some(notice) = on_menu(entry, &tray.paused, &tray.ui) {
+                                tray.notify(&notice);
+                            }
                             tray.refresh_icon();
                         }
                     }
@@ -347,7 +358,7 @@ fn copy_text<const N: usize>(buffer: &mut [u16; N], text: &str) {
     }
 }
 
-fn on_menu(choice: usize, paused: &AtomicBool, ui: &UiSender) {
+fn on_menu(choice: usize, paused: &AtomicBool, ui: &UiSender) -> Option<String> {
     match choice {
         MENU_PAUSE => {
             let now = !paused.fetch_xor(true, Ordering::Relaxed);
@@ -357,6 +368,7 @@ fn on_menu(choice: usize, paused: &AtomicBool, ui: &UiSender) {
             let enable = !autostart::is_enabled();
             if let Err(error) = autostart::set(enable) {
                 info!("autostart: {error}");
+                return Some(format!("开机自启设置失败：{error}"));
             }
         }
         MENU_CONFIG => open(&config_dir().to_string_lossy()),
@@ -366,6 +378,7 @@ fn on_menu(choice: usize, paused: &AtomicBool, ui: &UiSender) {
         MENU_QUIT => ui.send(UiMsg::Quit),
         _ => {}
     }
+    None
 }
 
 fn open(path: &str) {

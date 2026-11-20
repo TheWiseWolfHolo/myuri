@@ -3,13 +3,23 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{ImageProvider, ModelRef, Provider, Purpose, SpeechProvider};
+
 pub const HISTORY_DIR: &str = "history";
 const INDEX_FILE: &str = "index.json";
+static WRITES: Mutex<()> = Mutex::new(());
+static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
+
+fn lock_writes() -> MutexGuard<'static, ()> {
+    WRITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
@@ -28,6 +38,19 @@ pub struct Entry {
     /// Tools the assistant called in this message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<SavedCall>,
+    /// Synthesized audio card produced in direct speech mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<SavedAudio>,
+}
+
+/// A saved direct-TTS audio card.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedAudio {
+    pub path: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
 }
 
 /// A tool call and how it ended.
@@ -52,6 +75,8 @@ pub struct Conversation {
     /// `provider/model` it was last answered by.
     #[serde(default)]
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<Purpose>,
     /// Seconds since 1970.
     pub created: u64,
     pub updated: u64,
@@ -71,6 +96,37 @@ pub struct Summary {
 }
 
 impl Conversation {
+    /// Resolve a saved reference in its original channel list.
+    pub fn resume_model(
+        &self,
+        chat: &[Provider],
+        images: &[ImageProvider],
+        speech: &[SpeechProvider],
+    ) -> Option<(Purpose, ModelRef)> {
+        let reference = ModelRef::parse(&self.model)?;
+        let chat = chat.iter().find(|p| p.enabled && p.id == reference.provider);
+        let has_image = images.iter().any(|p| {
+            p.enabled && p.id == reference.provider && p.models.contains(&reference.model)
+        });
+        let purpose = self.purpose.unwrap_or_else(|| {
+            let image_reply = self.messages.iter().rev().find(|entry| entry.role == "assistant")
+                .is_some_and(|entry| !entry.shots.is_empty());
+            if image_reply || (has_image && chat.is_none_or(|p| !p.models.contains(&reference.model))) {
+                Purpose::Images
+            } else {
+                Purpose::Chat
+            }
+        });
+        let exists = match purpose {
+            Purpose::Chat => chat.is_some(),
+            Purpose::Images => has_image,
+            Purpose::Speech => speech.iter().any(|p| {
+                p.enabled && p.id == reference.provider && p.tts_models.contains(&reference.model)
+            }),
+        };
+        exists.then_some((purpose, reference))
+    }
+
     /// The first thing the user said, cut to one short line.
     pub fn title(&self) -> String {
         let first = self.messages.iter().find(|entry| entry.role == "user");
@@ -124,9 +180,22 @@ fn write_index(dir: &Path, index: &BTreeMap<String, Summary>) -> io::Result<()> 
 
 /// Write through a temporary file, so a crash never leaves half a file.
 fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let partial = path.with_extension("tmp");
-    fs::write(&partial, bytes)?;
-    fs::rename(partial, path)
+    let (partial, mut output) = loop {
+        let sequence = NEXT_PARTIAL.fetch_add(1, Ordering::Relaxed);
+        let partial = path.with_extension(format!("{}.{sequence}.tmp", std::process::id()));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&partial) {
+            Ok(output) => break (partial, output),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let written = output.write_all(bytes);
+    drop(output);
+    let result = written.and_then(|()| fs::rename(&partial, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    result
 }
 
 /// Summaries rebuilt from the conversation files themselves.
@@ -135,7 +204,9 @@ fn scan(dir: &Path) -> BTreeMap<String, Summary> {
     entries
         .flatten()
         .filter(|entry| entry.file_name() != INDEX_FILE)
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
+        .filter_map(|path| fs::read_to_string(path).ok())
         .filter_map(|text| serde_json::from_str::<Conversation>(&text).ok())
         .map(|conversation| (conversation.id.clone(), conversation.summary()))
         .collect()
@@ -143,8 +214,10 @@ fn scan(dir: &Path) -> BTreeMap<String, Summary> {
 
 pub fn save(dir: &Path, conversation: &Conversation) -> io::Result<()> {
     let path = file(dir, &conversation.id).ok_or(io::ErrorKind::InvalidInput)?;
+    let bytes = serde_json::to_vec(conversation)?;
+    let _guard = lock_writes();
     fs::create_dir_all(folder(dir))?;
-    replace(&path, serde_json::to_string(conversation)?.as_bytes())?;
+    replace(&path, &bytes)?;
     let mut index = read_index(dir).unwrap_or_else(|| scan(dir));
     index.insert(conversation.id.clone(), conversation.summary());
     write_index(dir, &index)
@@ -156,6 +229,10 @@ pub fn load(dir: &Path, id: &str) -> Option<Conversation> {
 }
 
 pub fn delete(dir: &Path, id: &str) -> io::Result<()> {
+    let _guard = lock_writes();
+    if !folder(dir).exists() {
+        return Ok(());
+    }
     if let Some(path) = file(dir, id) {
         match fs::remove_file(path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
@@ -170,11 +247,14 @@ pub fn delete(dir: &Path, id: &str) -> io::Result<()> {
 /// Every saved conversation, newest first.
 pub fn list(dir: &Path) -> Vec<Summary> {
     let index = read_index(dir).unwrap_or_else(|| {
-        let index = scan(dir);
-        if !index.is_empty() {
-            let _ = write_index(dir, &index);
-        }
-        index
+        let _guard = lock_writes();
+        read_index(dir).unwrap_or_else(|| {
+            let index = scan(dir);
+            if !index.is_empty() {
+                let _ = write_index(dir, &index);
+            }
+            index
+        })
     });
     let mut summaries: Vec<Summary> = index.into_values().collect();
     summaries.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| b.id.cmp(&a.id)));
@@ -204,6 +284,7 @@ mod tests {
             id: id.into(),
             assistant: "翻译".into(),
             model: "a/b".into(),
+            purpose: None,
             created: updated,
             updated,
             messages: vec![
@@ -246,7 +327,37 @@ mod tests {
         fs::write(folder(&dir).join(INDEX_FILE), "not json").unwrap();
         assert_eq!(list(&dir)[0].title, "kept");
         fs::remove_file(folder(&dir).join(INDEX_FILE)).unwrap();
+        let partial = serde_json::to_vec(&sample("partial", 30, "uncommitted")).unwrap();
+        fs::write(folder(&dir).join("partial.1.tmp"), partial).unwrap();
         assert_eq!(list(&dir).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_creates_and_deletes_keep_the_index_complete() {
+        const COUNT: u64 = 12;
+        let dir = scratch("concurrent");
+        for n in 0..COUNT {
+            save(&dir, &sample(&format!("old-{n}"), n, "old")).unwrap();
+        }
+        let start = std::sync::Barrier::new(COUNT as usize * 2);
+        std::thread::scope(|scope| {
+            for n in 0..COUNT {
+                let (dir, start) = (&dir, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    save(dir, &sample(&format!("new-{n}"), n, "new")).unwrap();
+                });
+                scope.spawn(move || {
+                    start.wait();
+                    delete(dir, &format!("old-{n}")).unwrap();
+                });
+            }
+        });
+        assert_eq!(read_index(&dir).unwrap(), scan(&dir));
+        let index = list(&dir);
+        assert_eq!(index.len(), COUNT as usize);
+        assert!(index.iter().all(|entry| entry.id.starts_with("new-")));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -268,5 +379,29 @@ mod tests {
         assert_eq!(ago(100, 90), "刚刚");
         assert_eq!(ago(4000, 100), "1 小时前");
         assert_eq!(ago(200_000, 100), "2 天前");
+    }
+
+    #[test]
+    fn reopening_history_keeps_same_id_channels_independent() {
+        let mut history = sample("1", 1, "prompt");
+        let chat = crate::config::parse_providers("[[provider]]\nid = 'a'\nbase_url = 'https://example.test'\nmodels = ['b']").unwrap();
+        let image = [ImageProvider {
+            id: "a".into(), models: vec!["b".into()], ..ImageProvider::default()
+        }];
+        let speech = [SpeechProvider {
+            id: "a".into(), tts_models: vec!["b".into()], ..SpeechProvider::default()
+        }];
+        let reference = ModelRef { provider: "a".into(), model: "b".into() };
+        let json = serde_json::to_string(&history).unwrap();
+        let legacy: Conversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.purpose, None);
+        assert_eq!(legacy.resume_model(&chat, &image, &speech), Some((Purpose::Chat, reference.clone())));
+        history.messages[1].shots.push("sample.png".into());
+        assert_eq!(history.resume_model(&chat, &image, &speech), Some((Purpose::Images, reference.clone())));
+        assert!(history.resume_model(&chat, &[], &speech).is_none());
+        history.purpose = Some(Purpose::Speech);
+        let saved: Conversation = serde_json::from_str(&serde_json::to_string(&history).unwrap()).unwrap();
+        assert_eq!(saved.resume_model(&chat, &image, &speech), Some((Purpose::Speech, reference)));
+        assert!(saved.resume_model(&chat, &image, &[]).is_none());
     }
 }

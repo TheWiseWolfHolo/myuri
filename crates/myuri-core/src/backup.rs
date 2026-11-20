@@ -22,10 +22,43 @@ pub const REMOTE_NAME: &str = "myuri-backup.json";
 const VERSION: u32 = 1;
 const ROUNDS: u32 = 210_000;
 
-/// Folders that are part of a backup, besides the three settings files.
+/// Folders that are part of a backup, besides the configuration files.
 const FOLDERS: &[&str] = &[config::PROMPTS_DIR, "icons", crate::mcp::SKILLS_DIR];
 /// Downloaded copies that come back by themselves.
 const CACHES: &[&str] = &["icons/lobehub", "icons/web"];
+pub const WEBDAV_KEY: &str = "@webdav";
+
+type Check = fn(&str) -> Result<(), String>;
+const CONFIG_CHECKS: &[(&str, Check)] = &[
+    (config::SETTINGS_FILE, |text| config::parse_settings(text).map(|_| ())),
+    (config::ASSISTANTS_FILE, |text| config::parse_assistants(text).map(|_| ())),
+    (config::PROVIDERS_FILE, |text| config::parse_providers(text).map(|_| ())),
+    (config::IMAGE_PROVIDERS_FILE, |text| config::parse_image_providers(text).map(|_| ())),
+    (config::SPEECH_PROVIDERS_FILE, |text| config::parse_speech_providers(text).map(|_| ())),
+];
+
+fn validate_config(name: &str, check: Check, bytes: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| format!("{name} 不是文本"))?;
+    check(text.trim_start_matches('\u{feff}')).map_err(|problem| format!("{name} 有问题：{problem}"))
+}
+
+/// Resolve a provider credential key. WebDAV has a separate, reserved entry.
+pub fn provider_credential(key: &str) -> Option<(&'static str, &str)> {
+    let (namespace, id) = match key.split_once(':') {
+        Some(("image", id)) => (config::NS_IMAGE, id),
+        Some(("speech", id)) => (config::NS_SPEECH, id),
+        Some(_) => return None,
+        None => (config::NS_CHAT, key),
+    };
+    config::valid_provider_id(id).then_some((namespace, id))
+}
+
+fn validate_keys(keys: &BTreeMap<String, String>) -> Result<(), String> {
+    if keys.keys().any(|key| provider_credential(key).is_none()) {
+        return Err("备份里有无效的密钥条目".into());
+    }
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize)]
 struct Sealed {
@@ -62,21 +95,29 @@ fn slashed(path: &Path) -> String {
 }
 
 /// Everything in `dir` that belongs in a backup.
-pub fn collect(dir: &Path, with_history: bool) -> BTreeMap<String, Vec<u8>> {
-    let mut paths: Vec<PathBuf> = [config::SETTINGS_FILE, config::ASSISTANTS_FILE, config::PROVIDERS_FILE, crate::mcp::MCP_FILE]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
+pub fn collect(dir: &Path, with_history: bool) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut files = BTreeMap::new();
+    for &(name, check) in CONFIG_CHECKS {
+        let bytes = match fs::read(dir.join(name)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{name}：{error}")),
+        };
+        validate_config(name, check, &bytes)?;
+        files.insert(name.to_string(), bytes);
+    }
+    let mut paths = vec![PathBuf::from(crate::mcp::MCP_FILE)];
     let folders = FOLDERS.iter().copied().chain(with_history.then_some(HISTORY_DIR));
     for folder in folders {
         walk(dir, &dir.join(folder), &mut paths);
     }
-    paths
+    files.extend(paths
         .into_iter()
         .map(|path| (slashed(&path), path))
         .filter(|(name, _)| !CACHES.iter().any(|cache| name.starts_with(&format!("{cache}/"))))
         .filter_map(|(name, path)| fs::read(dir.join(path)).ok().map(|bytes| (name, bytes)))
-        .collect()
+    );
+    Ok(files)
 }
 
 fn cipher(password: &str, salt: &[u8]) -> ChaCha20Poly1305 {
@@ -94,8 +135,9 @@ pub fn pack(
 ) -> Result<Vec<u8>, String> {
     let keys = match keys {
         None => None,
-        Some((_, password)) if password.is_empty() => return Err("带上密钥的话要设一个密码".into()),
+        Some((_, "")) => return Err("带上密钥的话要设一个密码".into()),
         Some((keys, password)) => {
+            validate_keys(keys)?;
             let plain = serde_json::to_vec(keys).map_err(|error| error.to_string())?;
             let salt: [u8; 16] = rand_bytes();
             let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -147,6 +189,10 @@ impl Bundle {
         self.files.len()
     }
 
+    pub fn contains_file(&self, name: &str) -> bool {
+        self.files.contains_key(name)
+    }
+
     /// The keys in the backup, by provider id.
     pub fn keys(&self, password: &str) -> Result<BTreeMap<String, String>, String> {
         let Some(sealed) = &self.keys else { return Ok(BTreeMap::new()) };
@@ -158,7 +204,9 @@ impl Bundle {
         let plain = cipher(password, &salt)
             .decrypt(Nonce::from_slice(&nonce), data.as_slice())
             .map_err(|_| "密码不对".to_string())?;
-        serde_json::from_slice(&plain).map_err(|_| "备份里的密钥部分坏了".to_string())
+        let keys = serde_json::from_slice(&plain).map_err(|_| "备份里的密钥部分坏了".to_string())?;
+        validate_keys(&keys)?;
+        Ok(keys)
     }
 
     fn file(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
@@ -168,21 +216,14 @@ impl Bundle {
             .transpose()
     }
 
-    /// Write the files of the backup into `dir`. The three settings files
+    /// Write the files of the backup into `dir`. The settings files
     /// are checked first; what is about to be replaced is copied to
     /// `backups\<stamp>\`. Files the backup does not have stay as they are.
     /// Returns how many files were written.
     pub fn restore(&self, dir: &Path, stamp: u64) -> Result<usize, String> {
-        type Check = fn(&str) -> Result<(), String>;
-        let checks: [(&str, Check); 3] = [
-            (config::SETTINGS_FILE, |text| config::parse_settings(text).map(|_| ())),
-            (config::ASSISTANTS_FILE, |text| config::parse_assistants(text).map(|_| ())),
-            (config::PROVIDERS_FILE, |text| config::parse_providers(text).map(|_| ())),
-        ];
-        for (name, check) in checks {
+        for &(name, check) in CONFIG_CHECKS {
             if let Some(bytes) = self.file(name)? {
-                let text = String::from_utf8(bytes).map_err(|_| format!("备份里的 {name} 不是文本"))?;
-                check(text.trim_start_matches('\u{feff}')).map_err(|problem| format!("备份里的 {name} 有问题：{problem}"))?;
+                validate_config(name, check, &bytes).map_err(|problem| format!("备份里的 {problem}"))?;
             }
         }
         let mut writes = Vec::new();
@@ -232,14 +273,19 @@ mod tests {
         fs::write(from.join("icons/a.png"), [1, 2, 3]).unwrap();
         fs::write(from.join("icons/lobehub/x.svg"), "<svg/>").unwrap();
         fs::write(from.join("ui-state.toml"), "page = \"chat\"").unwrap();
-        let files = collect(&from, false);
+        config::migrate_split_providers(&from).unwrap();
+        let files = collect(&from, false).unwrap();
         assert!(files.contains_key("config.toml") && files.contains_key("prompts/翻译.md"));
         assert_eq!(files["icons/a.png"], [1, 2, 3]);
         assert!(!files.contains_key("icons/lobehub/x.svg") && !files.contains_key("ui-state.toml"));
 
-        let keys = BTreeMap::from([("openai".to_string(), "sk-one,sk-two".to_string())]);
+        let keys = BTreeMap::from([
+            ("example".into(), "dummy-chat".into()),
+            ("image:example".into(), "dummy-image".into()),
+            ("speech:example".into(), "dummy-speech".into()),
+        ]);
         let packed = pack(&files, Some((&keys, "correct horse")), 7).unwrap();
-        assert!(!String::from_utf8_lossy(&packed).contains("sk-one"));
+        assert!(!String::from_utf8_lossy(&packed).contains("dummy-chat"));
         let bundle = Bundle::open(&packed).unwrap();
         assert!(bundle.has_keys() && bundle.created == 7);
         assert_eq!(bundle.keys("correct horse").unwrap(), keys);
@@ -251,6 +297,8 @@ mod tests {
         assert_eq!(fs::read(to.join("icons/a.png")).unwrap(), [1, 2, 3]);
         assert_eq!(fs::read_to_string(to.join("backups/99/config.toml")).unwrap(), "# old\n");
         assert!(config::load_assistants(&to).is_ok());
+        assert_eq!(fs::read(to.join(config::IMAGE_PROVIDERS_FILE)).unwrap(), config::DEFAULT_IMAGE_PROVIDERS.as_bytes());
+        assert_eq!(fs::read(to.join(config::SPEECH_PROVIDERS_FILE)).unwrap(), config::DEFAULT_SPEECH_PROVIDERS.as_bytes());
         let _ = fs::remove_dir_all(from);
         let _ = fs::remove_dir_all(to);
     }
@@ -260,6 +308,9 @@ mod tests {
         let files = BTreeMap::from([("config.toml".to_string(), b"".to_vec())]);
         let keys = BTreeMap::new();
         assert!(pack(&files, Some((&keys, "")), 1).is_err());
+        for key in [WEBDAV_KEY, "image:@webdav", "speech:../test", "unknown:example", "image:"] {
+            assert!(pack(&files, Some((&BTreeMap::from([(key.into(), "dummy".into())]), "sample")), 1).is_err());
+        }
         let bundle = Bundle::open(&pack(&files, None, 1).unwrap()).unwrap();
         assert!(!bundle.has_keys() && bundle.keys("").unwrap().is_empty());
         assert!(Bundle::open(b"{}").is_err());

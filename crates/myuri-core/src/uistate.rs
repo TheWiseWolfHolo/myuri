@@ -15,6 +15,8 @@ pub const FILE: &str = "ui-state.toml";
 pub struct UiState {
     /// Provider groups folded in the settings list.
     pub folded: Vec<String>,
+    pub folded_images: Vec<String>,
+    pub folded_speech: Vec<String>,
     /// The settings window's size in logical pixels.
     pub window: UiWindow,
     /// The settings page that was open, such as "assistants" or "chat".
@@ -42,9 +44,15 @@ pub fn save(dir: &Path, state: &UiState) {
     if !state.page.is_empty() {
         text.push_str(&format!("page = {}\n", quoted(&state.page)));
     }
-    if !state.folded.is_empty() {
-        let folded = state.folded.iter().map(|group| quoted(group)).collect::<Vec<_>>().join(", ");
-        text.push_str(&format!("folded = [{folded}]\n"));
+    for (key, groups) in [
+        ("folded", &state.folded),
+        ("folded_images", &state.folded_images),
+        ("folded_speech", &state.folded_speech),
+    ] {
+        if !groups.is_empty() {
+            let folded = groups.iter().map(|group| quoted(group)).collect::<Vec<_>>().join(", ");
+            text.push_str(&format!("{key} = [{folded}]\n"));
+        }
     }
     if state.window.width > 0.0 && state.window.height > 0.0 {
         text.push_str(&format!(
@@ -70,6 +78,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let state = UiState {
             folded: vec!["主力".into(), "国际".into()],
+            folded_images: vec!["图片".into()],
+            folded_speech: vec![],
             window: UiWindow { width: 1120.4, height: 720.0 },
             page: "chat".into(),
         };

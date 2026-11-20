@@ -35,6 +35,11 @@ pub fn now() -> u64 {
 }
 
 impl HistoryView {
+    pub fn set_palette(&mut self, palette: Palette, cx: &mut Context<Self>) {
+        self.palette = palette;
+        cx.notify();
+    }
+
     pub fn new(dir: PathBuf, palette: Palette, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
         let subscriptions = vec![cx.subscribe_in(&search, window, |_, _, event: &InputEvent, _, cx| {
@@ -249,6 +254,50 @@ impl HistoryView {
                     .children(reply.as_ref().map(|view| TextView::new(view).selectable(true)))
                     .children(entry.shots.iter().map(|path| {
                         div().font(theme::sans()).text_size(px(12.0)).text_color(palette.muted).child(path.clone())
+                    }))
+                    .children(entry.audio.as_ref().map(|audio| {
+                        let secs = audio.duration_ms / 1000;
+                        let open = PathBuf::from(&audio.path);
+                        let select = open.clone();
+                        div()
+                            .max_w(px(420.0))
+                            .p(px(9.0))
+                            .rounded(px(9.0))
+                            .border_1()
+                            .border_color(palette.hairline)
+                            .bg(palette.raised)
+                            .font(theme::sans())
+                            .text_size(px(12.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(svg().path("icons/audio-lines.svg").size(px(14.0)).flex_none().text_color(palette.accent))
+                            .child(div().flex_none().text_color(palette.muted).child(format!("{}:{:02}", secs / 60, secs % 60)))
+                            .child(div().flex_1().min_w(px(0.0)).truncate().text_color(palette.muted).child(audio.summary.clone()))
+                            .child(
+                                div()
+                                    .id(format!("hist-open-{}", audio.path))
+                                    .px(px(7.0))
+                                    .py(px(2.0))
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .text_color(palette.muted)
+                                    .hover(move |style| style.bg(palette.selected))
+                                    .child("打开")
+                                    .on_click(move |_, _, _| crate::win::shell_open(&open)),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("hist-dir-{}", audio.path))
+                                    .px(px(7.0))
+                                    .py(px(2.0))
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .text_color(palette.muted)
+                                    .hover(move |style| style.bg(palette.selected))
+                                    .child("文件夹")
+                                    .on_click(move |_, _, _| crate::win::shell_select(&select)),
+                            )
                     }))
             }
         });

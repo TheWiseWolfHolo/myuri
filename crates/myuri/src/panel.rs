@@ -9,11 +9,12 @@ use std::time::Duration;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, Subscription, Window,
+    MouseButton, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point, px,
     size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use regex::Regex;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
@@ -95,6 +96,43 @@ struct Entry {
     assistant: Assistant,
     keys: Keys,
     glyph: Glyph,
+    pattern: Option<Regex>,
+    preferred: bool,
+}
+
+impl Entry {
+    fn new(assistant: Assistant) -> Self {
+        let pattern = assistant.pattern.as_deref().map(|pattern| {
+            Regex::new(pattern).expect("assistant match pattern was validated when reading configuration")
+        });
+        Self {
+            keys: Keys::new(&assistant.name),
+            glyph: Glyph::of(&assistant),
+            assistant,
+            pattern,
+            preferred: false,
+        }
+    }
+}
+
+fn prioritize(entries: &mut [Entry], capture: &Captured) {
+    let selected = match capture.content.as_ref() {
+        Some((Content::Text(text), Origin::Selection)) => Some(text.as_str()),
+        _ => None,
+    };
+    for entry in entries {
+        entry.preferred = selected.zip(entry.pattern.as_ref()).is_some_and(|(text, re)| re.is_match(text));
+    }
+}
+
+fn ranked_rows(entries: &[Entry], kind: Option<ContentKind>, query: &str) -> Vec<usize> {
+    let fitting: Vec<_> = entries.iter().enumerate()
+        .filter_map(|(index, entry)| entry.assistant.accepts(kind).then_some(index))
+        .collect();
+    let ranked = matching::rank(fitting.iter().map(|&index| &entries[index].keys), query);
+    let mut listed: Vec<_> = ranked.into_iter().map(|position| fitting[position]).collect();
+    listed.sort_by_key(|&index| !entries[index].preferred);
+    listed
 }
 
 pub struct PanelView {
@@ -114,6 +152,7 @@ pub struct PanelView {
     /// Indices into `entries` that fit the content and the typed filter.
     listed: Vec<usize>,
     query: String,
+    scroll: ScrollHandle,
     /// Row highlighted by the keyboard or the pointer.
     selected: usize,
     /// Row the pointer is resting on.
@@ -194,6 +233,7 @@ impl PanelView {
             capture: Captured::default(),
             listed: Vec::new(),
             query: String::new(),
+            scroll: ScrollHandle::new(),
             selected: 0,
             hovered: None,
             chosen: None,
@@ -215,12 +255,9 @@ impl PanelView {
         self.entries = assistants
             .into_iter()
             .filter(|assistant| assistant.enabled)
-            .map(|assistant| Entry {
-                keys: Keys::new(&assistant.name),
-                glyph: Glyph::of(&assistant),
-                assistant,
-            })
+            .map(Entry::new)
             .collect();
+        prioritize(&mut self.entries, &self.capture);
         self.refilter();
     }
 
@@ -298,6 +335,7 @@ impl PanelView {
 
     fn present(&mut self, capture: Captured, window: &mut Window, cx: &mut Context<Self>) {
         self.capture = capture;
+        prioritize(&mut self.entries, &self.capture);
         self.query.clear();
         self.hovered = None;
         self.chosen = None;
@@ -316,12 +354,10 @@ impl PanelView {
 
     fn refilter(&mut self) {
         let kind = self.capture.content.as_ref().map(|(content, _)| content.kind());
-        let fitting: Vec<usize> = (0..self.entries.len())
-            .filter(|&index| self.entries[index].assistant.accepts(kind))
-            .collect();
-        let ranked = matching::rank(fitting.iter().map(|&index| &self.entries[index].keys), &self.query);
-        self.listed = ranked.into_iter().map(|position| fitting[position]).collect();
+        self.listed = ranked_rows(&self.entries, kind, &self.query);
         self.selected = 0;
+        self.hovered = None;
+        self.scroll.set_offset(point(px(0.0), px(0.0)));
     }
 
     fn has_header(&self) -> bool {
@@ -434,7 +470,13 @@ impl PanelView {
         }
         let rows = self.listed.len();
         match keystroke.key.as_str() {
-            "escape" => return self.dismiss(cx),
+            "escape" if event.is_held => return,
+            "escape" if self.query.is_empty() => return self.dismiss(cx),
+            "escape" => {
+                self.query.clear();
+                self.refilter();
+                self.place(false);
+            }
             "enter" => return self.choose(self.selected, cx),
             "down" | "tab" if rows > 0 && !(keystroke.key == "tab" && modifiers.shift) => {
                 self.selected = (self.selected + 1) % rows;
@@ -467,6 +509,7 @@ impl PanelView {
                 self.place(false);
             }
         }
+        self.scroll.scroll_to_item(self.selected);
         cx.notify();
     }
 
@@ -557,6 +600,7 @@ impl Render for PanelView {
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .py(px(PADDING))
             .flex()
             .flex_col();
@@ -650,6 +694,36 @@ fn summarize(content: &Content, origin: Origin) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matching_selected_text_takes_priority_without_bypassing_filters() {
+        let assistants = myuri_core::config::parse_assistants(r#"
+[[assistant]]
+name = "通用"
+
+[[assistant]]
+name = "报错解释"
+match = '^ERROR [0-9]+'
+
+[[assistant]]
+name = "报错核对"
+match = '^ERROR'
+
+[[assistant]]
+name = "图片说明"
+input = ["image"]
+match = '.'
+"#).unwrap();
+        let mut entries: Vec<_> = assistants.into_iter().map(Entry::new).collect();
+        let text = || Content::Text("ERROR 1234".into());
+        let text_kind = Some(ContentKind::Text);
+        prioritize(&mut entries, &Captured { content: Some((text(), Origin::Selection)) });
+        assert_eq!(ranked_rows(&entries, text_kind, ""), [1, 2, 0]);
+        assert_eq!(ranked_rows(&entries, text_kind, "bc"), [1, 2]);
+        assert_eq!(ranked_rows(&entries, text_kind, "ty"), [0]);
+        prioritize(&mut entries, &Captured { content: Some((text(), Origin::Clipboard)) });
+        assert_eq!(ranked_rows(&entries, text_kind, ""), [0, 1, 2]);
+    }
 
     const AREA: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
 

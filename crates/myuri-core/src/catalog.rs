@@ -1,7 +1,6 @@
-//! What each model can do, taken from the models.dev catalog: what kind of
-//! model it is, whether it reads pictures, and how its reasoning is
-//! controlled. Providers name the same model in many ways, so lookups go
-//! through a normalized name.
+//! Model capabilities and official model lists from models.dev. Providers
+//! name the same model in many ways, so capability lookups use a normalized
+//! name while official lists retain the model IDs used in requests.
 
 use std::collections::BTreeMap;
 
@@ -24,8 +23,8 @@ pub enum Kind {
     Realtime,
 }
 
-/// Field names are single letters because a few thousand of these are stored.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Short field names keep the snapshot compact.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelInfo {
     #[serde(rename = "k", default, skip_serializing_if = "is_chat")]
     pub kind: Kind,
@@ -43,6 +42,24 @@ pub struct ModelInfo {
     /// Thinking can be switched off and on.
     #[serde(rename = "t", default, skip_serializing_if = "is_false")]
     pub toggle: bool,
+    #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<u32>,
+    #[serde(rename = "o", default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u32>,
+    #[serde(rename = "tc", default, skip_serializing_if = "is_false")]
+    pub tool_call: bool,
+    #[serde(rename = "tp", default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<bool>,
+    #[serde(rename = "p", default, skip_serializing_if = "is_false")]
+    pub pdf: bool,
+    /// USD per million input tokens.
+    #[serde(rename = "ci", default, skip_serializing_if = "Option::is_none")]
+    pub cost_in: Option<f64>,
+    /// USD per million output tokens.
+    #[serde(rename = "co", default, skip_serializing_if = "Option::is_none")]
+    pub cost_out: Option<f64>,
+    #[serde(rename = "d", default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
 }
 
 fn is_chat(kind: &Kind) -> bool {
@@ -57,6 +74,17 @@ fn is_false(value: &bool) -> bool {
 const LARGEST_BUDGET: u32 = 32_000;
 
 impl ModelInfo {
+    pub fn context_label(&self) -> Option<String> {
+        let context = self.context.filter(|&tokens| tokens > 0)?;
+        let (scale, unit) = match context {
+            1_000_000.. => (1_000_000, "M"),
+            1_000.. => (1_000, "K"),
+            _ => return Some(context.to_string()),
+        };
+        let value = format!("{:.1}", f64::from(context) / f64::from(scale));
+        Some(format!("{}{unit}", value.strip_suffix(".0").unwrap_or(&value)))
+    }
+
     /// The reasoning settings worth offering, weakest first. Empty when the
     /// model does not reason.
     pub fn levels(&self) -> Vec<Reasoning> {
@@ -114,9 +142,12 @@ pub fn nearest(levels: &[Reasoning], wanted: Reasoning) -> Option<Reasoning> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
 pub struct Catalog {
+    // Older snapshots contain this model map at the root.
+    #[serde(flatten)]
     models: BTreeMap<String, ModelInfo>,
+    #[serde(rename = "@vendors", default, skip_serializing_if = "BTreeMap::is_empty")]
+    vendors: BTreeMap<String, Vec<String>>,
 }
 
 /// Providers describing their own models; their word wins over a reseller's.
@@ -134,16 +165,26 @@ impl Catalog {
         let mut ordered: Vec<(&String, &Value)> = providers.iter().collect();
         ordered.sort_by_key(|(id, _)| rank(id));
         let mut models = BTreeMap::new();
-        for (_, provider) in ordered {
+        let mut vendors = BTreeMap::new();
+        for (vendor, provider) in ordered {
+            let mut official = Vec::new();
+            let first_party = FIRST_PARTY.contains(&vendor.as_str());
             for (id, model) in provider["models"].as_object().into_iter().flatten() {
+                if first_party {
+                    official.push((id, model["release_date"].as_str()));
+                }
                 // First come, first kept: first parties were sorted to the front.
                 models.entry(normalize(id)).or_insert_with(|| describe(model));
+            }
+            if !official.is_empty() {
+                official.sort_by(|(id_a, date_a), (id_b, date_b)| date_b.cmp(date_a).then(id_a.cmp(id_b)));
+                vendors.insert(vendor.clone(), official.into_iter().map(|(id, _)| id.clone()).collect());
             }
         }
         if models.is_empty() {
             return Err("目录里没有模型".into());
         }
-        Ok(Self { models })
+        Ok(Self { models, vendors })
     }
 
     pub fn from_snapshot(source: &str) -> Result<Self, String> {
@@ -160,6 +201,38 @@ impl Catalog {
 
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
+    }
+
+    /// Official providers listed in the order of the models.dev index preference.
+    pub fn vendors(&self) -> impl Iterator<Item = &'static str> + '_ {
+        FIRST_PARTY.iter().copied().filter(|id| self.vendors.contains_key(*id))
+    }
+
+    /// Exact model IDs, newest releases first.
+    pub fn vendor_models(&self, vendor: &str) -> &[String] {
+        self.vendors.get(vendor).map_or(&[], Vec::as_slice)
+    }
+
+    /// Keep models from a legacy cached snapshot and use the shipped index and
+    /// metadata for the official lists until the user refreshes the cache.
+    pub fn supplement_legacy(&mut self, shipped: &Self) {
+        if !self.vendors.is_empty() {
+            return;
+        }
+        self.vendors.clone_from(&shipped.vendors);
+        for (id, info) in &shipped.models {
+            let entry = self.models.entry(id.clone()).or_insert_with(|| info.clone());
+            entry.context = entry.context.or(info.context);
+            entry.output = entry.output.or(info.output);
+            entry.tool_call |= info.tool_call;
+            entry.temperature = entry.temperature.or(info.temperature);
+            entry.pdf |= info.pdf;
+            entry.cost_in = entry.cost_in.or(info.cost_in);
+            entry.cost_out = entry.cost_out.or(info.cost_out);
+            if entry.release_date.is_none() {
+                entry.release_date.clone_from(&info.release_date);
+            }
+        }
     }
 
     /// What is known about a model, whatever the provider calls it. Relays add
@@ -200,6 +273,7 @@ pub fn normalize(model: &str) -> String {
 
 fn describe(model: &Value) -> ModelInfo {
     let has = |list: &Value, what: &str| list.as_array().is_some_and(|l| l.iter().any(|v| v == what));
+    let limit = |key: &str| model["limit"][key].as_u64().and_then(|n| u32::try_from(n).ok());
     let (input, output) = (&model["modalities"]["input"], &model["modalities"]["output"]);
     let kind = match model["type"].as_str() {
         Some("image") => Kind::Image,
@@ -219,6 +293,14 @@ fn describe(model: &Value) -> ModelInfo {
         kind,
         vision: has(input, "image"),
         reasoning: model["reasoning"] == true,
+        context: limit("context"),
+        output: limit("output"),
+        tool_call: model["tool_call"] == true,
+        temperature: model["temperature"].as_bool(),
+        pdf: has(input, "pdf"),
+        cost_in: model["cost"]["input"].as_f64(),
+        cost_out: model["cost"]["output"].as_f64(),
+        release_date: model["release_date"].as_str().map(str::to_string),
         ..ModelInfo::default()
     };
     for option in model["reasoning_options"].as_array().into_iter().flatten() {
@@ -257,9 +339,13 @@ mod tests {
       }},
       "openai": {"models": {
         "gpt-9.5": {"reasoning": true,
+          "release_date": "2025-04-30", "tool_call": true, "temperature": false,
+          "limit": {"context": 1048576, "output": 128000},
+          "cost": {"input": 1.25, "output": 10.0},
           "reasoning_options": [{"type": "effort", "values": ["none", "low", "high", "xhigh", "bogus"]}],
-          "modalities": {"input": ["text", "image"], "output": ["text"]}},
-        "embed-3": {"type": "embedding", "reasoning": false, "modalities": {"input": ["text"], "output": ["text"]}}
+          "modalities": {"input": ["text", "image", "pdf"], "output": ["text"]}},
+        "embed-3": {"type": "embedding", "reasoning": false, "release_date": "2025-01-02",
+          "modalities": {"input": ["text"], "output": ["text"]}}
       }},
       "google": {"models": {
         "gemini-2.5-flash": {"reasoning": true,
@@ -298,6 +384,23 @@ mod tests {
         assert_eq!(gpt.efforts, [None, Low, High, Xhigh]);
         assert_eq!(catalog.lookup("painter-1").unwrap().kind, Kind::Image);
         assert_eq!(catalog.lookup("embed-3").unwrap().kind, Kind::Embedding);
+    }
+
+    #[test]
+    fn official_models_keep_wire_ids_in_release_order() {
+        let catalog = catalog();
+        assert_eq!(catalog.vendors().collect::<Vec<_>>(), ["openai", "anthropic", "google", "zhipuai"]);
+        assert_eq!(catalog.vendor_models("openai"), ["gpt-9.5", "embed-3"]);
+        assert!(catalog.vendor_models("reseller").is_empty());
+        let info = catalog.lookup("gpt-9.5").unwrap();
+        assert_eq!(info.context, Some(1_048_576));
+        assert_eq!(info.context_label().as_deref(), Some("1M"));
+        assert_eq!(info.output, Some(128_000));
+        assert_eq!(info.temperature, Some(false));
+        assert_eq!(info.cost_in, Some(1.25));
+        assert_eq!(info.cost_out, Some(10.0));
+        assert_eq!(info.release_date.as_deref(), Some("2025-04-30"));
+        assert!(info.pdf && info.tool_call);
     }
 
     #[test]
@@ -357,5 +460,20 @@ mod tests {
         assert_eq!(Catalog::from_snapshot(&snapshot), Ok(catalog));
         assert!(Catalog::from_models_dev("[]").is_err());
         assert!(Catalog::from_models_dev("{}").is_err());
+    }
+
+    #[test]
+    fn legacy_snapshots_keep_existing_model_capabilities() {
+        let mut legacy = Catalog::from_snapshot(r#"{"gpt-9-5":{"v":true},"custom-model":{}}"#).unwrap();
+        assert_eq!(legacy.len(), 2);
+        assert!(legacy.vendor_models("openai").is_empty());
+        assert_eq!(legacy.lookup("gpt-9.5").unwrap().context, Option::None);
+        legacy.supplement_legacy(&catalog());
+        let info = legacy.lookup("gpt-9.5").unwrap();
+        assert!(info.vision);
+        assert!(!info.reasoning);
+        assert_eq!(info.context, Some(1_048_576));
+        assert!(legacy.lookup("custom-model").is_some());
+        assert_eq!(legacy.vendor_models("openai"), ["gpt-9.5", "embed-3"]);
     }
 }

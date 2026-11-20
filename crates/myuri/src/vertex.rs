@@ -12,7 +12,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::DecodePrivateKey;
-use rsa::sha2::Sha256;
+use rsa::sha2::{Digest, Sha256};
 use rsa::signature::{SignatureEncoding, Signer};
 use serde_json::{Value, json};
 
@@ -25,17 +25,21 @@ const KEEP: Duration = Duration::from_secs(50 * 60);
 /// The access token for a provider, from memory while it is fresh. Blocks on
 /// the network when a new one is needed.
 pub fn token(provider: &str, account: &str) -> Result<String, String> {
-    static TOKENS: Mutex<Option<HashMap<String, (String, Instant)>>> = Mutex::new(None);
-    let cached = |tokens: &Option<HashMap<String, (String, Instant)>>| {
-        let (token, since) = tokens.as_ref()?.get(provider)?;
-        (since.elapsed() < KEEP).then(|| token.clone())
-    };
-    if let Some(token) = cached(&TOKENS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())) {
-        return Ok(token);
+    type CacheKey = (String, [u8; 32]);
+    static TOKENS: Mutex<Option<HashMap<CacheKey, (String, Instant)>>> = Mutex::new(None);
+    let key = (provider.to_string(), Sha256::digest(account.as_bytes()).into());
+    {
+        let mut cache = TOKENS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tokens) = cache.as_mut() {
+            tokens.retain(|_, (_, since)| since.elapsed() < KEEP);
+            if let Some((token, _)) = tokens.get(&key) {
+                return Ok(token.clone());
+            }
+        }
     }
     let token = sign_in(account)?;
     let mut tokens = TOKENS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    tokens.get_or_insert_with(HashMap::new).insert(provider.to_string(), (token.clone(), Instant::now()));
+    tokens.get_or_insert_with(HashMap::new).insert(key, (token.clone(), Instant::now()));
     Ok(token)
 }
 
@@ -76,6 +80,8 @@ fn sign_in(account: &str) -> Result<String, String> {
 
 /// Replace the API key header of a Gemini request with the access token.
 pub fn authorize(headers: &mut Vec<(String, String)>, token: &str) {
-    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("x-goog-api-key"));
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("x-goog-api-key") && !name.eq_ignore_ascii_case("authorization")
+    });
     headers.push(("authorization".into(), format!("Bearer {token}")));
 }

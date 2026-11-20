@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::net::{self, Abort, Attempt};
-use crate::secrets;
+use crate::{secrets, vertex};
 
 /// Counts the requests made through each provider, for taking turns among
 /// its keys.
@@ -114,35 +114,32 @@ impl Route {
             KeyStrategy::RoundRobin => next_turn(&self.provider_id),
             KeyStrategy::Sticky => self.seat,
         };
-        let mut on_event = on_event;
-        // Vertex takes an access token where others take the key itself.
-        let token = match self.provider.vertex {
-            true => match crate::vertex::token(&self.provider_id, &self.stored) {
-                Ok(token) => Some(token),
-                Err(reason) => {
-                    on_event(Event::Error(reason));
-                    return net::stream(Vec::new(), self.api, |_| {});
-                }
-            },
-            false => None,
-        };
-        let authorized = |mut request: llm::HttpRequest| {
-            if let Some(token) = &token {
-                crate::vertex::authorize(&mut request.headers, token);
-            }
-            request
-        };
+        let account = self.provider.vertex.then(|| (self.provider_id.clone(), self.stored.clone()));
         let attempts = self
             .provider
             .keys_to_try(&self.stored, turn)
             .into_iter()
-            .map(|key| Attempt {
-                request: authorized(build(key, reasoning)),
-                // Some models refuse a reasoning level they do not have. Keep
-                // a request without one ready for that case.
-                plain: reasoning.map(|_| authorized(build(key, None))),
+            .map(|key| {
+                let key = if account.is_some() { "" } else { key };
+                Attempt {
+                    request: build(key, reasoning),
+                    // Some models refuse a reasoning level they do not have. Keep
+                    // a request without one ready for that case.
+                    plain: reasoning.map(|_| build(key, None)),
+                }
             })
             .collect();
-        net::stream(attempts, self.api, on_event)
+        net::stream(attempts, self.api, move |attempts| {
+            if let Some((id, account)) = account {
+                let token = vertex::token(&id, &account)?;
+                for attempt in attempts {
+                    vertex::authorize(&mut attempt.request.headers, &token);
+                    if let Some(plain) = &mut attempt.plain {
+                        vertex::authorize(&mut plain.headers, &token);
+                    }
+                }
+            }
+            Ok(())
+        }, on_event)
     }
 }

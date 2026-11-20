@@ -36,6 +36,7 @@ pub struct ToolsView {
     /// The delete button was pressed once.
     deleting: bool,
     busy: bool,
+    test_generation: u64,
     status: Option<(bool, String)>,
 }
 
@@ -53,6 +54,11 @@ fn lines_of(map: &BTreeMap<String, String>) -> String {
 }
 
 impl ToolsView {
+    pub fn set_palette(&mut self, palette: Palette, cx: &mut Context<Self>) {
+        self.palette = palette;
+        cx.notify();
+    }
+
     pub fn new(dir: PathBuf, palette: Palette, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             name: cx.new(|cx| InputState::new(window, cx).placeholder("只能字母、数字、- 和 _")),
@@ -68,6 +74,7 @@ impl ToolsView {
             confirm: true,
             deleting: false,
             busy: false,
+            test_generation: 0,
             status: None,
             dir,
             palette,
@@ -149,7 +156,8 @@ impl ToolsView {
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(old) = self.servers.get(self.open).map(|server| server.name.clone()) else { return };
+        let Some(old_server) = self.servers.get(self.open).cloned() else { return };
+        let old = old_server.name.clone();
         let server = self.written(cx);
         let map = |map: &BTreeMap<String, String>| Field::Map(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
         let flag = |on: bool| if on { Field::Absent } else { Field::Flag(false) };
@@ -164,6 +172,9 @@ impl ToolsView {
             ("confirm", flag(server.confirm)),
         ];
         let outcome = self.write(|source| edit::set_entry(source, "server", "name", &old, &changes));
+        if outcome.is_ok() && (!server.enabled || server != old_server) {
+            crate::mcp::stop_server(&old);
+        }
         self.finish(outcome, Some(server.name), window, cx);
     }
 
@@ -173,25 +184,35 @@ impl ToolsView {
             return cx.notify();
         }
         let outcome = self.write(|source| edit::remove_entry(source, "server", "name", &name));
+        if outcome.is_ok() {
+            crate::mcp::stop_server(&name);
+        }
         self.finish(outcome, None, window, cx);
     }
 
     /// Start the server as written in the form and list its tools.
     fn test(&mut self, cx: &mut Context<Self>) {
+        let Some(saved_name) = self.servers.get(self.open).map(|server| &server.name) else { return };
         let server = self.written(cx);
         if server.command.is_empty() == server.url.is_empty() {
             self.status = Some((false, "命令和地址填一个".into()));
             return cx.notify();
         }
+        self.test_generation = self.test_generation.wrapping_add(1);
+        let generation = self.test_generation;
         self.busy = true;
         self.status = None;
+        let probe = crate::mcp::prepare_probe(saved_name, &server);
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(crate::mcp::probe(&server));
+            let _ = tx.send_blocking(probe());
         });
         cx.spawn(async move |this, cx| {
             let Ok(outcome) = rx.recv().await else { return };
             let _ = this.update(cx, |this, cx| {
+                if this.test_generation != generation {
+                    return;
+                }
                 this.busy = false;
                 this.status = Some(match outcome {
                     Ok(tools) if tools.is_empty() => (true, "连上了，它没有提供工具".into()),
@@ -229,6 +250,8 @@ impl ToolsView {
                 .child(div().flex_1().min_w(px(0.0)).truncate().child(server.name.clone()))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open = index;
+                    this.test_generation = this.test_generation.wrapping_add(1);
+                    this.busy = false;
                     this.status = None;
                     this.fill(window, cx);
                 }))

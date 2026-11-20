@@ -1,28 +1,29 @@
 name: Release
 
-# Push a tag like v0.1.0 to build and publish a release.
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check the tag against the version
-        shell: bash
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: pwsh
         run: |
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
-            exit 1
-          fi
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'myuri').version
+          if ("v$version" -cne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
+          }
       - name: Test
         run: cargo test --workspace --locked
       - name: Build
@@ -33,9 +34,28 @@ jobs:
           New-Item -ItemType Directory -Force package | Out-Null
           Copy-Item target/release/myuri.exe, README.md, LICENSE package/
           Compress-Archive -Path package/* -DestinationPath Myuri-windows-x64.zip
-          $hash = (Get-FileHash Myuri-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
-          [IO.File]::WriteAllText("$PWD/Myuri-windows-x64.zip.sha256", "$hash  Myuri-windows-x64.zip`n")
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          path: Myuri-windows-x64.zip
+          archive: false
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: Myuri-windows-x64.zip
+          skip-decompress: true
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME Myuri-windows-x64.zip Myuri-windows-x64.zip.sha256 --title "Myuri $env:GITHUB_REF_NAME" --generate-notes
+        run: |
+          sha256sum Myuri-windows-x64.zip > Myuri-windows-x64.zip.sha256
+          gh release create "$GITHUB_REF_NAME" Myuri-windows-x64.zip Myuri-windows-x64.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "Myuri $GITHUB_REF_NAME" --generate-notes
